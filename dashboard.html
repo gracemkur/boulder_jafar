@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FloodBot Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b;
+    --text: #e6e9ee; --dim: #8b95a3; --accent: #4ea1ff;
+    --ok: #2fbf71; --warn: #f0b429; --bad: #ef4444; --auto: #2fbf71; --manual: #4ea1ff; --assist: #f0b429;
+    --c1: #4ea1ff; --c2: #f0b429; --c3: #c084fc;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; letter-spacing: .5px; }
+  .pill { padding: 3px 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line);
+    font-weight: 600; font-size: 12px; white-space: nowrap; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 25%, transparent); border-color: var(--ok); }
+  .pill.bad { background: color-mix(in srgb, var(--bad) 30%, transparent); border-color: var(--bad); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 25%, transparent); border-color: var(--warn); }
+  .pill.m-stop { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .pill.m-manual { background: var(--manual); border-color: var(--manual); color: #fff; }
+  .pill.m-assist { background: var(--assist); border-color: var(--assist); color: #111; }
+  .pill.m-auto { background: var(--auto); border-color: var(--auto); color: #111; }
+  .spacer { flex: 1; }
+  #estop { background: var(--bad); color: #fff; border: 0; border-radius: 10px; padding: 10px 22px;
+    font-weight: 800; font-size: 16px; letter-spacing: 1px; cursor: pointer; box-shadow: 0 0 0 3px #ef444455; }
+  #estop:active { transform: scale(.97); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px 16px; max-width: 1500px; margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); margin: 0 0 10px;
+    display: flex; align-items: center; gap: 8px; }
+  section h2 .r { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .camwrap { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; }
+  .camwrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 20px; color: var(--dim); background: #000c; }
+  canvas { width: 100%; display: block; background: var(--panel2); border-radius: 8px; }
+  #lidar { aspect-ratio: 1 / 1; }
+  #chart { height: 150px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 12px; font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { border-color: var(--bad); color: #fecaca; }
+  button.go { border-color: var(--ok); color: #bbf7d0; }
+  label { color: var(--dim); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+  input[type=range] { width: 120px; }
+  select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 3px; }
+  .pad { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(2, 52px); gap: 6px; }
+  .pad button { font-size: 18px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .pad button.held { background: var(--accent); color: #fff; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-variant-numeric: tabular-nums; }
+  .kv div:nth-child(odd) { color: var(--dim); }
+  .bar { position: relative; height: 10px; background: var(--panel2); border-radius: 5px; margin-top: 3px; }
+  .bar::after { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--dim); }
+  .bar i { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 5px; }
+  .hint { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--panel2); color: var(--dim); font-size: 13px; }
+  .hint b { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; }
+  td { padding: 3px 6px; border-bottom: 1px solid var(--line); }
+  td.num { text-align: right; }
+  tr.stale td { color: var(--bad); }
+  #events { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; max-height: 180px; overflow-y: auto; color: var(--dim); }
+  #banner { display: none; margin: 8px 0; padding: 10px; border-radius: 8px; border: 1px solid var(--warn);
+    background: color-mix(in srgb, var(--warn) 15%, transparent); }
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--panel2);
+    border: 1px solid var(--line); padding: 10px 16px; border-radius: 10px; opacity: 0; transition: opacity .2s;
+    pointer-events: none; max-width: 90vw; z-index: 10; }
+  #toast.show { opacity: 1; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: var(--dim); }
+  .legend i { width: 14px; height: 3px; display: inline-block; border-radius: 2px; }
+  .full { grid-column: 1 / -1; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>FloodBot</h1>
+  <span class="pill" id="p-conn">connecting…</span>
+  <span class="pill" id="p-mode">mode ?</span>
+  <span class="pill" id="p-armed">armed ?</span>
+  <span class="pill" id="p-driver">nobody driving</span>
+  <span class="pill warn" id="p-fake" hidden>FAKE ROBOT</span>
+  <span class="pill bad" id="p-teleop" hidden>teleop_key running</span>
+  <span class="spacer"></span>
+  <button id="estop" title="SPACE">E-STOP</button>
+</header>
+
+<main>
+  <section>
+    <h2>Camera <span class="r" id="cam-info"></span></h2>
+    <div class="camwrap">
+      <img id="cam" alt="camera feed" src="/stream.mjpg">
+      <div class="overlay" id="cam-overlay">No camera frames.<br>Is camera_node running? (it publishes /perception/debug_image/compressed)</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Lidar <span class="r" id="lidar-info"></span></h2>
+    <canvas id="lidar"></canvas>
+    <div class="row">
+      <label>range <input type="range" id="l-range" min="1" max="8" step="0.5"> <span id="l-range-v"></span> m</label>
+      <label>mount rotation
+        <select id="l-rot"><option value="0">0°</option><option value="90">90°</option>
+          <option value="180">180°</option><option value="270">270°</option></select></label>
+      <label><input type="checkbox" id="l-flip"> mirror</label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Drive &amp; wheel tests <span class="r" id="cmd-info"></span></h2>
+    <div class="row">
+      <button class="primary" id="b-take">Take control</button>
+      <button id="b-release" disabled>Release</button>
+      <button class="go" id="b-arm" disabled>Arm…</button>
+      <button class="danger" id="b-disarm">Disarm</button>
+    </div>
+    <div class="row">
+      <button data-mode="resume" disabled>Resume (R)</button>
+      <button data-mode="manual" disabled>Manual (M)</button>
+      <button data-mode="assist" disabled>Assist (K)</button>
+      <button data-mode="auto" disabled>Auto (O)</button>
+    </div>
+    <div class="row" style="align-items:flex-start; gap:18px">
+      <div class="pad">
+        <span></span><button data-dir="up" title="W / ↑">▲</button><span></span>
+        <button data-dir="left" title="A / ←">◀</button><button data-dir="down" title="S / ↓">▼</button><button data-dir="right" title="D / →">▶</button>
+      </div>
+      <div>
+        <label>throttle <input type="range" id="s-thr" min="0.05" max="0.2" step="0.01"> <span id="s-thr-v"></span></label><br>
+        <label>steer <input type="range" id="s-steer" min="0.1" max="1" step="0.05"> <span id="s-steer-v"></span></label>
+        <p class="hint" style="margin-top:8px">Hold <b>W A S D</b> / arrows or the pad. Release = zero.
+          <b>SPACE</b> = E-STOP. Closing this tab while driving = STOP.</p>
+      </div>
+    </div>
+    <div class="row">
+      <span style="color:var(--dim);font-size:12px">Wheel tests:</span>
+      <button data-test="left" disabled>Steer left</button>
+      <button data-test="right" disabled>Steer right</button>
+      <button data-test="sweep" disabled>Steer sweep</button>
+      <button data-test="fwd" disabled>Forward pulse</button>
+      <button data-test="rev" disabled>Reverse pulse</button>
+    </div>
+    <div id="banner"></div>
+  </section>
+
+  <section>
+    <h2>Autonomy</h2>
+    <div class="kv">
+      <div>line offset</div><div><span id="v-off">–</span><div class="bar"><i id="bar-off"></i></div></div>
+      <div>view_ok</div><div id="v-view">–</div>
+      <div>/cmd/auto</div><div><span id="v-auto">–</span><div class="bar"><i id="bar-auto"></i></div></div>
+      <div>/cmd/drive</div><div><span id="v-drive">–</span><div class="bar"><i id="bar-drive"></i></div></div>
+    </div>
+    <div class="legend" style="margin-top:10px">
+      <span><i style="background:var(--c1)"></i>offset</span>
+      <span><i style="background:var(--c2)"></i>auto steer</span>
+      <span><i style="background:var(--c3)"></i>drive steer</span>
+      <span>last 10 s, −1 … +1 (+steer = LEFT, +offset = line RIGHT)</span>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="hint" id="hint">waiting for data…</div>
+  </section>
+
+  <section>
+    <h2>Topics</h2>
+    <table id="topics"></table>
+  </section>
+
+  <section>
+    <h2>Events</h2>
+    <div id="events"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const T_IMG = "/perception/debug_image/compressed";
+
+// ---------------------------------------------------------------- settings (per browser)
+function load(k, d) { try { const v = localStorage.getItem("fb." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } }
+function save(k, v) { try { localStorage.setItem("fb." + k, JSON.stringify(v)); } catch (e) {} }
+const cfg = { range: load("range", 3), rot: load("rot", 0), flip: load("flip", false),
+              thr: load("thr", 0.15), steer: load("steer", 0.6) };
+
+// ---------------------------------------------------------------- state
+let S = null, lastStateAt = 0, scan = null;
+let token = null, tokenAt = 0;
+const keys = new Set();
+let testRun = null, override = null;
+const hist = [];
+
+function toast(msg, ms = 2500) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove("show"), ms);
+}
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body || {}) });
+    return await r.json();
+  } catch (e) { return { ok: false, msg: "network error" }; }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const fmt = (v, d = 2) => (v === null || v === undefined || !isFinite(v)) ? "–" : (v >= 0 ? "+" : "") + v.toFixed(d);
+
+// ---------------------------------------------------------------- live data
+const es = new EventSource("/events");
+es.addEventListener("state", (e) => { S = JSON.parse(e.data); lastStateAt = performance.now(); onState(); });
+es.addEventListener("scan", (e) => { scan = JSON.parse(e.data); drawLidar(); });
+
+const cam = $("cam");
+cam.onerror = () => setTimeout(() => { cam.src = "/stream.mjpg?" + Date.now(); }, 2000);
+
+setInterval(() => {   // connection watchdog for the page itself
+  const up = performance.now() - lastStateAt < 1500;
+  const p = $("p-conn"); p.textContent = up ? "connected" : "DISCONNECTED"; p.className = "pill " + (up ? "ok" : "bad");
+  if (!up) { keys.clear(); renderPad(); }
+}, 500);
+
+// ---------------------------------------------------------------- control
+function currentCmd() {
+  if (override) return override;
+  const cap = S ? S.cap : 0.2;
+  const thr = Math.min(cfg.thr, cap) * ((keys.has("up") ? 1 : 0) - (keys.has("down") ? 1 : 0));
+  const steer = cfg.steer * ((keys.has("left") ? 1 : 0) - (keys.has("right") ? 1 : 0));
+  return { thr, steer };
+}
+setInterval(async () => {   // 10 Hz command + deadman heartbeat
+  if (!token) return;
+  const c = currentCmd();
+  $("cmd-info").textContent = `sending thr ${fmt(c.thr)} steer ${fmt(c.steer)}`;
+  const r = await post("/api/drive", { token, thr: c.thr, steer: c.steer });
+  if (!r.ok && token) lostControl(r.msg);
+}, 100);
+
+function lostControl(msg) {
+  token = null; abortTest(); keys.clear(); renderPad(); renderButtons();
+  $("cmd-info").textContent = "";
+  toast("Lost control: " + msg, 4000);
+}
+async function estop() {
+  abortTest(); keys.clear(); renderPad();
+  const r = await post("/api/estop", {});
+  toast(r.ok ? "E-STOP sent" : "E-STOP FAILED: " + r.msg + " (use teleop SPACE / kill power)", 4000);
+}
+$("estop").onclick = estop;
+$("b-take").onclick = async () => {
+  const r = await post("/api/take", {});
+  if (r.ok) { token = r.token; tokenAt = performance.now(); toast("You have control. Press Resume to leave STOP."); } else toast(r.msg, 4000);
+  renderButtons();
+};
+$("b-release").onclick = async () => {
+  abortTest();
+  const r = await post("/api/release", { token }); token = null; renderButtons();
+  $("cmd-info").textContent = ""; toast(r.msg);
+};
+$("b-arm").onclick = async () => {
+  if (!confirm("ARM the Pixhawk?\n\nWheels OFF the ground (or area clear) and hands away from the wheels?")) return;
+  keys.clear(); renderPad();
+  await sleep(150);   // let a neutral command go out first
+  const r = await post("/api/arm", { token, arm: true }); toast(r.msg);
+};
+$("b-disarm").onclick = async () => { const r = await post("/api/arm", { token, arm: false }); toast(r.msg); };
+document.querySelectorAll("[data-mode]").forEach((b) => {
+  b.onclick = async () => { const r = await post("/api/mode", { token, mode: b.dataset.mode }); toast(r.msg); };
+});
+
+// keyboard + pad (hold to drive)
+const KEYMAP = { KeyW: "up", ArrowUp: "up", KeyS: "down", ArrowDown: "down",
+                 KeyA: "left", ArrowLeft: "left", KeyD: "right", ArrowRight: "right" };
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); estop(); return; }
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (testRun) { abortTest("aborted by key"); return; }
+  const d = KEYMAP[e.code];
+  if (d) { e.preventDefault(); if (token) { keys.add(d); renderPad(); } }
+});
+window.addEventListener("keyup", (e) => { const d = KEYMAP[e.code]; if (d) { keys.delete(d); renderPad(); } });
+window.addEventListener("blur", () => { keys.clear(); renderPad(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { keys.clear(); renderPad(); } });
+document.querySelectorAll("[data-dir]").forEach((b) => {
+  const d = b.dataset.dir;
+  const on = (e) => { e.preventDefault(); if (!token) return; if (testRun) abortTest("aborted"); keys.add(d); b.setPointerCapture(e.pointerId); renderPad(); };
+  const off = () => { keys.delete(d); renderPad(); };
+  b.addEventListener("pointerdown", on);
+  ["pointerup", "pointercancel", "lostpointercapture"].forEach((ev) => b.addEventListener(ev, off));
+});
+function renderPad() { document.querySelectorAll("[data-dir]").forEach((b) => b.classList.toggle("held", keys.has(b.dataset.dir))); }
+
+// sliders
+function bindSlider(id, key, digits) {
+  const el = $(id), out = $(id + "-v");
+  el.value = cfg[key]; out.textContent = (+el.value).toFixed(digits);
+  el.oninput = () => { cfg[key] = +el.value; out.textContent = cfg[key].toFixed(digits); save(key, cfg[key]); };
+}
+bindSlider("s-thr", "thr", 2); bindSlider("s-steer", "steer", 2);
+$("l-range").value = cfg.range; $("l-range-v").textContent = cfg.range;
+$("l-range").oninput = (e) => { cfg.range = +e.target.value; $("l-range-v").textContent = cfg.range; save("range", cfg.range); drawLidar(); };
+$("l-rot").value = String(cfg.rot); $("l-rot").onchange = (e) => { cfg.rot = +e.target.value; save("rot", cfg.rot); drawLidar(); };
+$("l-flip").checked = cfg.flip; $("l-flip").onchange = (e) => { cfg.flip = e.target.checked; save("flip", cfg.flip); drawLidar(); };
+
+// ---------------------------------------------------------------- wheel tests
+const TESTS = {
+  left:  { label: "Steer LEFT 0.5 for 1.5 s", check: "Did the front wheels point LEFT?", steps: [[0, 0.5, 1500]] },
+  right: { label: "Steer RIGHT 0.5 for 1.5 s", check: "Did the front wheels point RIGHT?", steps: [[0, -0.5, 1500]] },
+  sweep: { label: "Steer sweep right → left", check: "Did the wheels sweep smoothly from full RIGHT to full LEFT?",
+           steps: Array.from({ length: 41 }, (_, i) => [0, -1 + i * 0.05, 100]) },
+  fwd:   { label: "Forward pulse 0.15 for 1 s", check: "Did the wheels spin FORWARD?", steps: [[0.15, 0, 1000]] },
+  rev:   { label: "Reverse pulse −0.15 for 1 s", check: "Did the wheels spin BACKWARD? (some ESCs need a second pulse to engage reverse)",
+           steps: [[-0.15, 0, 1000]] },
+};
+function banner(html) { const b = $("banner"); b.innerHTML = html; b.style.display = html ? "block" : "none"; }
+function abortTest(why) {
+  if (!testRun) return;
+  testRun.abort = true; override = null; testRun = null;
+  banner(why ? "Test " + why + "." : "");
+}
+async function runTest(name) {
+  const t = TESTS[name];
+  if (!token) { toast("Take control first"); return; }
+  const warn = [];
+  if (S && S.mode !== "manual") warn.push("mode is <b>" + (S.mode || "?") + "</b>, not manual: control_node will ignore it");
+  if (S && !S.armed) warn.push("drive is <b>not armed</b>: nothing will move");
+  abortTest(); keys.clear(); renderPad();
+  const run = { abort: false }; testRun = run;
+  banner("<b>RUNNING:</b> " + t.label + " (any key or E-STOP aborts)" + (warn.length ? "<br>⚠ " + warn.join("<br>⚠ ") : ""));
+  const cap = S ? S.cap : 0.2;
+  for (const [thr, steer, ms] of t.steps) {
+    if (run.abort) return;
+    override = { thr: Math.max(-cap, Math.min(cap, thr)), steer };
+    await sleep(ms);
+  }
+  if (run.abort) return;
+  override = null; testRun = null;
+  banner("<b>Done:</b> " + t.check + "<br>If not: restart drive_node with <code>--steer-sign -1</code> (steering) or <code>--throttle-sign 1</code> (throttle).");
+}
+document.querySelectorAll("[data-test]").forEach((b) => { b.onclick = () => runTest(b.dataset.test); });
+
+// ---------------------------------------------------------------- rendering
+function renderButtons() {
+  const have = !!token;
+  $("b-take").disabled = have; $("b-release").disabled = !have; $("b-arm").disabled = !have;
+  document.querySelectorAll("[data-mode],[data-test]").forEach((b) => (b.disabled = !have));
+}
+function setBar(id, v) {
+  const el = $(id);
+  if (v === null || v === undefined || !isFinite(v)) { el.style.width = "0"; return; }
+  v = Math.max(-1, Math.min(1, v));
+  el.style.left = (v >= 0 ? 50 : 50 + v * 50) + "%"; el.style.width = Math.abs(v) * 50 + "%";
+}
+function stale(topic, limit = 1.0) { const a = S && S.ages[topic]; return a === null || a === undefined || a > limit; }
+
+function onState() {
+  const s = S;
+  // header
+  const m = s.mode || "?";
+  const pm = $("p-mode"); pm.textContent = "mode " + m.toUpperCase(); pm.className = "pill m-" + m;
+  if (stale("/mode", 3)) { pm.textContent = "no control_node"; pm.className = "pill bad"; }
+  const pa = $("p-armed");
+  if (stale("/drive/armed", 3)) { pa.textContent = "no drive_node"; pa.className = "pill bad"; }
+  else { pa.textContent = s.armed ? "ARMED" : "disarmed"; pa.className = "pill " + (s.armed ? "warn" : ""); }
+  const pd = $("p-driver");
+  if (token) { pd.textContent = "YOU have control"; pd.className = "pill ok"; }
+  else if (s.driver) { pd.textContent = s.driver.ip + " has control"; pd.className = "pill warn"; }
+  else { pd.textContent = "nobody driving"; pd.className = "pill"; }
+  if (token && !s.driver && performance.now() - tokenAt > 1000) lostControl("server released control (deadman or E-STOP)");
+  $("p-fake").hidden = !s.fake;
+  $("p-teleop").hidden = !(s.other_manual > 0);
+  $("s-thr").max = s.cap;
+
+  // camera
+  $("cam-overlay").style.display = stale(T_IMG, 2) ? "flex" : "none";
+  $("cam-info").textContent = stale(T_IMG, 2) ? "no frames" : s.hz[T_IMG].toFixed(1) + " fps";
+
+  // autonomy
+  $("v-off").textContent = s.offset_nan ? "NaN (no line)" : fmt(s.offset, 3);
+  setBar("bar-off", s.offset);
+  const v = $("v-view");
+  v.textContent = s.view_ok === null ? "–" : String(s.view_ok);
+  v.style.color = s.view_ok ? "var(--ok)" : "var(--bad)";
+  const a = s.auto, d = s.drive;
+  $("v-auto").textContent = a ? `thr ${fmt(a[0])}  steer ${fmt(a[1])}` : "–";
+  $("v-drive").textContent = d ? `thr ${fmt(d[0])}  steer ${fmt(d[1])}` : "–";
+  setBar("bar-auto", a ? a[1] : null); setBar("bar-drive", d ? d[1] : null);
+
+  const hints = [];
+  if (s.fake) hints.push("<b>FAKE robot</b>: synthetic data, nothing real moves.");
+  if (stale("/mode", 3)) hints.push("<b>control_node not running</b> (no /mode): nothing reaches /cmd/drive.");
+  if (stale("/drive/armed", 3)) hints.push("<b>drive_node not running</b> (no /drive/armed).");
+  else if (!s.armed) hints.push("Drive is <b>disarmed</b>: wheels won't move. Take control → Arm.");
+  if (stale("/cmd/auto")) hints.push("<b>auto_node not running</b> (no /cmd/auto): AUTO will be refused.");
+  if (stale("/perception/view_ok")) hints.push("<b>camera_node not running</b> (no view_ok): AUTO/ASSIST refused.");
+  else if (s.view_ok === false) hints.push("<b>view_ok is False</b>: AUTO/ASSIST refused, or latched STOP if already in them.");
+  if (s.offset_nan) hints.push("No line detected (offset NaN): auto_node publishes zero.");
+  if (s.mode === "stop") hints.push("<b>STOP is latched</b>: take control and press Resume (lands in MANUAL).");
+  if (s.other_manual > 0) hints.push("<b>teleop_key.py is running</b>: quit it before taking control here.");
+  $("hint").innerHTML = hints.length ? hints.join("<br>") : "All good. In AUTO the wheels should steer toward the tape.";
+
+  // chart history
+  const now = performance.now() / 1000;
+  hist.push({ t: now, off: s.offset, a: a ? a[1] : null, d: d ? d[1] : null });
+  while (hist.length && now - hist[0].t > 10) hist.shift();
+  drawChart();
+
+  // topics
+  const rows = Object.keys(s.ages).map((t) => {
+    const age = s.ages[t], st = age === null || age > 1.0;
+    return `<tr class="${st ? "stale" : ""}"><td>${t}</td><td class="num">${s.hz[t].toFixed(1)} Hz</td>` +
+           `<td class="num">${age === null ? "never" : age.toFixed(2) + " s"}</td></tr>`;
+  });
+  $("topics").innerHTML = rows.join("");
+
+  // events
+  $("events").innerHTML = s.events.slice().reverse().map((e) => `<div>${e[0]}  ${escapeHtml(e[1])}</div>`).join("");
+}
+function escapeHtml(t) { return t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); return [g, w, h];
+}
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawChart() {
+  const [g, w, h] = fitCanvas($("chart"));
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = css("--line"); g.lineWidth = 1;
+  [0.25, 0.5, 0.75].forEach((f) => { g.beginPath(); g.moveTo(0, h * f); g.lineTo(w, h * f); g.stroke(); });
+  if (!hist.length) return;
+  const t1 = hist[hist.length - 1].t, x = (t) => w - (t1 - t) / 10 * w, y = (v) => h / 2 - v * (h / 2 - 4);
+  [["off", "--c1"], ["a", "--c2"], ["d", "--c3"]].forEach(([k, col]) => {
+    g.strokeStyle = css(col); g.lineWidth = 2; g.beginPath(); let pen = false;
+    for (const p of hist) {
+      const v = p[k];
+      if (v === null || v === undefined || !isFinite(v)) { pen = false; continue; }
+      if (pen) g.lineTo(x(p.t), y(v)); else { g.moveTo(x(p.t), y(v)); pen = true; }
+    }
+    g.stroke();
+  });
+}
+
+function drawLidar() {
+  const c = $("lidar"), [g, w, h] = fitCanvas(c);
+  const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 8, k = R / cfg.range;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = css("--line"); g.fillStyle = css("--dim"); g.font = "11px system-ui"; g.lineWidth = 1;
+  const stepM = cfg.range > 4 ? 1 : 0.5;
+  for (let r = stepM; r <= cfg.range + 1e-6; r += stepM) {
+    g.beginPath(); g.arc(cx, cy, r * k, 0, Math.PI * 2); g.stroke(); g.fillText(r + " m", cx + 3, cy - r * k + 12);
+  }
+  g.beginPath(); g.moveTo(cx, cy - R); g.lineTo(cx, cy + R); g.moveTo(cx - R, cy); g.lineTo(cx + R, cy); g.stroke();
+  // car (forward = up)
+  g.fillStyle = css("--accent"); g.fillRect(cx - 7, cy - 11, 14, 22);
+  g.beginPath(); g.moveTo(cx, cy - 22); g.lineTo(cx - 6, cy - 13); g.lineTo(cx + 6, cy - 13); g.fill();
+  if (!scan) { $("lidar-info").textContent = "no /scan"; return; }
+  const rot = cfg.rot * Math.PI / 180;
+  let front = Infinity;
+  g.fillStyle = css("--warn");
+  for (const [a0, r] of scan.pts) {
+    let a = (cfg.flip ? -a0 : a0) + rot;                          // ROS: 0 = forward, + = left (CCW)
+    a = Math.atan2(Math.sin(a), Math.cos(a));
+    if (Math.abs(a) < Math.PI / 6) front = Math.min(front, r);
+    if (r > cfg.range) continue;
+    g.fillRect(cx - Math.sin(a) * r * k - 1.5, cy - Math.cos(a) * r * k - 1.5, 3, 3);
+  }
+  const st = stale("/scan", 1.5);
+  $("lidar-info").textContent = (st ? "STALE · " : (S ? S.hz["/scan"].toFixed(1) + " Hz · " : "")) +
+    "front ±30°: " + (isFinite(front) ? front.toFixed(2) + " m" : "clear");
+}
+window.addEventListener("resize", () => { drawLidar(); drawChart(); });
+renderButtons(); drawLidar(); drawChart();
+</script>
+</body>
+</html>
