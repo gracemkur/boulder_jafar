@@ -137,7 +137,7 @@
         <label>throttle <input type="range" id="s-thr" min="0.05" max="0.2" step="0.01"> <span id="s-thr-v"></span></label><br>
         <label>steer <input type="range" id="s-steer" min="0.1" max="1" step="0.05"> <span id="s-steer-v"></span></label>
         <p class="hint" style="margin-top:8px">Hold <b>W A S D</b> / arrows or the pad. Release = zero.
-          <b>SPACE</b> = E-STOP. Closing this tab while driving = STOP.</p>
+          <b>SPACE</b> = E-STOP. Link late &gt; 0.3 s = neutral; silent &gt; 1.5 s or tab closed = STOP.</p>
       </div>
     </div>
     <div class="row">
@@ -235,13 +235,34 @@ function currentCmd() {
   const steer = cfg.steer * ((keys.has("left") ? 1 : 0) - (keys.has("right") ? 1 : 0));
   return { thr, steer };
 }
-setInterval(async () => {   // 10 Hz command + deadman heartbeat
-  if (!token) return;
-  const c = currentCmd();
-  $("cmd-info").textContent = `sending thr ${fmt(c.thr)} steer ${fmt(c.steer)}`;
-  const r = await post("/api/drive", { token, thr: c.thr, steer: c.steer });
-  if (!r.ok && token) lostControl(r.msg);
-}, 100);
+// 10 Hz command + deadman heartbeat. One request at a time (no pile-up on slow Wi-Fi).
+// A network error is not fatal: the server's deadman goes neutral after 0.3 s and STOPs after 1.5 s.
+let rttAvg = null, netErrs = 0;
+(async function cmdLoop() {
+  for (;;) {
+    const t0 = performance.now();
+    if (token) {
+      const c = currentCmd();
+      const r = await post("/api/drive", { token, thr: c.thr, steer: c.steer });
+      const rtt = performance.now() - t0;
+      if (r.ok) {
+        netErrs = 0;
+        rttAvg = rttAvg === null ? rtt : 0.8 * rttAvg + 0.2 * rtt;
+      } else if (r.msg === "network error") {
+        netErrs++;
+      } else if (token) {
+        lostControl(r.msg);
+      }
+      if (token) {
+        const late = S && S.driver ? S.driver.late : 0;
+        $("cmd-info").textContent = `sending thr ${fmt(c.thr)} steer ${fmt(c.steer)} · ` +
+          (netErrs ? `NETWORK ERRORS ${netErrs}` : `rtt ${rttAvg === null ? "–" : Math.round(rttAvg)} ms`) +
+          (late ? ` · late ${late}×` : "");
+      }
+    }
+    await sleep(Math.max(10, 100 - (performance.now() - t0)));
+  }
+})();
 
 function lostControl(msg) {
   token = null; abortTest(); keys.clear(); renderPad(); renderButtons();
@@ -370,7 +391,8 @@ function onState() {
   if (stale("/drive/armed", 3)) { pa.textContent = "no drive_node"; pa.className = "pill bad"; }
   else { pa.textContent = s.armed ? "ARMED" : "disarmed"; pa.className = "pill " + (s.armed ? "warn" : ""); }
   const pd = $("p-driver");
-  if (token) { pd.textContent = "YOU have control"; pd.className = "pill ok"; }
+  if (token && s.driver && s.driver.holding) { pd.textContent = "YOU · link slow, neutral"; pd.className = "pill warn"; }
+  else if (token) { pd.textContent = "YOU have control"; pd.className = "pill ok"; }
   else if (s.driver) { pd.textContent = s.driver.ip + " has control"; pd.className = "pill warn"; }
   else { pd.textContent = "nobody driving"; pd.className = "pill"; }
   if (token && !s.driver && performance.now() - tokenAt > 1000) lostControl("server released control (deadman or E-STOP)");
