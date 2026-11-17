@@ -14,6 +14,7 @@ Subscribes
   /scan                               sensor_msgs/LaserScan        RPLidar
   /perception/line_offset             std_msgs/Float32
   /perception/view_ok                 std_msgs/Bool
+  /perception/status                  std_msgs/String  JSON: source (color|ir), confidence, reason
   /cmd/auto  /cmd/drive               geometry_msgs/Twist
   /mode                               std_msgs/String  (control_node, transient-local)
   /drive/armed                        std_msgs/Bool    (drive_node)
@@ -27,8 +28,10 @@ SAFETY
     view_ok rules all still apply.
   * One driver at a time ("Take control"). Refused while another /cmd/manual publisher
     (teleop_key.py) is running; if one appears while driving, control is dropped + STOP.
-  * Deadman: the driver's browser sends a command every 100 ms. Silent > 0.3 s (tab closed,
-    Wi-Fi dropped) -> latched STOP request + control released. Also in AUTO.
+  * Deadman, two stages. The driver's browser sends a command every 100 ms.
+    Silent > 0.3 s (Wi-Fi hiccup) -> /cmd/manual goes to zero, the driver keeps control.
+    Silent > 1.5 s (tab closed, Wi-Fi dropped) -> latched STOP request + control released.
+    The STOP stage also applies in AUTO.
   * Anyone can E-STOP or disarm. Mode changes and arming need control. Throttle is clamped
     to --max-throttle on the server.
 
@@ -57,7 +60,8 @@ from urllib.parse import urlparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 HTML_PATH = os.path.join(HERE, "dashboard.html")
 
-DEADMAN_S = 0.3          # driver silent this long -> STOP
+HOLD_S = 0.3             # driver silent this long -> publish neutral (keeps control)
+DEADMAN_S = 1.5          # driver silent this long -> STOP + control released
 PUBLISH_HZ = 20.0        # /cmd/manual rate (same as teleop_key)
 STATE_HZ = 10            # SSE state rate
 SCAN_EVERY = 2           # send scan every N state ticks (5 Hz)
@@ -68,11 +72,13 @@ T_IMG = "/perception/debug_image/compressed"
 T_SCAN = "/scan"
 T_OFFSET = "/perception/line_offset"
 T_VIEW = "/perception/view_ok"
+T_STATUS = "/perception/status"
 T_AUTO = "/cmd/auto"
 T_DRIVE = "/cmd/drive"
 T_MODE = "/mode"
 T_ARMED = "/drive/armed"
-TOPICS = [T_IMG, T_SCAN, T_OFFSET, T_VIEW, T_AUTO, T_DRIVE, T_MODE, T_ARMED]
+TOPICS = [T_IMG, T_SCAN, T_OFFSET, T_VIEW, T_STATUS, T_AUTO, T_DRIVE, T_MODE, T_ARMED]
+STATUS_KEYS = ("source", "confidence", "reason", "bright", "lap_var", "degrade")
 MODE_REQUESTS = ("manual", "auto", "assist", "resume")
 
 
@@ -122,6 +128,7 @@ class Hub:
         self.scan_seq = 0
         self.offset = None
         self.view_ok = None
+        self.status = None        # subset of camera_node's /perception/status JSON
         self.auto = None          # [thr, steer]
         self.drive = None         # [thr, steer]
         self.mode = None
@@ -164,6 +171,15 @@ class Hub:
             setattr(self, attr, value)
             self._mark(topic)
 
+    def on_status(self, text):
+        """camera_node's /perception/status JSON. Keep only known keys; ignore garbage."""
+        try:
+            d = json.loads(text)
+        except ValueError:
+            return
+        if isinstance(d, dict):
+            self.set(T_STATUS, "status", {k: d.get(k) for k in STATUS_KEYS})
+
     def on_image(self, jpeg):
         with self.frame_cond:
             self.jpeg = bytes(jpeg)
@@ -199,7 +215,7 @@ class Hub:
             if self.other_manual > 0:
                 return False, "another /cmd/manual publisher is running (teleop_key.py?). Quit it first.", None
             token = secrets.token_hex(8)
-            self.driver = dict(token=token, ip=ip, t_hb=now, thr=0.0, steer=0.0)
+            self.driver = dict(token=token, ip=ip, t_hb=now, thr=0.0, steer=0.0, late=0, holding=False)
             self._event("%s took control" % ip)
             return True, "you have control", token
 
@@ -253,10 +269,17 @@ class Hub:
         now = time.monotonic()
         with self.lock:
             d = self.driver
-            if d is not None and now - d["t_hb"] > DEADMAN_S:
-                self._drop_driver("heartbeat lost from %s (%.2fs)" % (d["ip"], now - d["t_hb"]))
+            gap = None if d is None else now - d["t_hb"]
+            if d is not None and gap > DEADMAN_S:
+                self._drop_driver("heartbeat lost from %s (%.2fs)" % (d["ip"], gap))
                 d = None
-            if d is not None:
+            if d is not None and gap > HOLD_S:
+                if not d["holding"]:          # late heartbeat: neutral, but keep control
+                    d["holding"] = True
+                    d["late"] += 1
+                cmd = (0.0, 0.0)
+            elif d is not None:
+                d["holding"] = False
                 cmd = (d["thr"], d["steer"])
             elif self.zero_pending > 0:
                 self.zero_pending -= 1
@@ -278,11 +301,12 @@ class Hub:
                 fake=self.fake, mode=self.mode, armed=self.armed,
                 offset=off if (off is not None and math.isfinite(off)) else None,
                 offset_nan=off is not None and not math.isfinite(off),
-                view_ok=self.view_ok, auto=self.auto, drive=self.drive,
+                view_ok=self.view_ok, status=self.status, auto=self.auto, drive=self.drive,
                 ages={t: (round(now - self.last[t], 2) if t in self.last else None) for t in TOPICS},
                 hz={t: round(self.rates[t].hz(now), 1) for t in TOPICS},
                 cap=self.max_throttle, other_manual=self.other_manual,
-                driver=None if d is None else dict(ip=d["ip"], thr=d["thr"], steer=d["steer"]),
+                driver=None if d is None else dict(ip=d["ip"], thr=d["thr"], steer=d["steer"],
+                                                   late=d["late"], holding=d["holding"]),
                 events=list(self.events)[-15:],
             )
 
@@ -310,6 +334,7 @@ def make_handler(hub):
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "FloodBotDash/1.0"
+        protocol_version = "HTTP/1.1"   # keep-alive: the 10 Hz drive POSTs reuse one connection
 
         def log_message(self, fmt, *args):  # keep the console readable
             pass
@@ -353,7 +378,9 @@ def make_handler(hub):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")   # no Content-Length: body ends when we close
             self.end_headers()
+            self.close_connection = True
             last_scan, n = -1, 0
             try:
                 while not hub.stopping:
@@ -374,7 +401,9 @@ def make_handler(hub):
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
+            self.close_connection = True
             last, t_last = -1, 0.0
             try:
                 while not hub.stopping:
@@ -400,6 +429,7 @@ def make_handler(hub):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 if n > 4096:
+                    self.close_connection = True   # unread body would corrupt the next request
                     return self._json(413, {"ok": False, "msg": "body too large"})
                 body = json.loads(self.rfile.read(n).decode() or "{}") if n else {}
                 if not isinstance(body, dict):
@@ -459,6 +489,7 @@ def run_ros(p, hub, stop):
             sub(LaserScan, T_SCAN, self.on_scan, best_effort)
             sub(Float32, T_OFFSET, lambda m: hub.set(T_OFFSET, "offset", float(m.data)), best_effort)
             sub(Bool, T_VIEW, lambda m: hub.set(T_VIEW, "view_ok", bool(m.data)), best_effort)
+            sub(String, T_STATUS, lambda m: hub.on_status(m.data), best_effort)
             sub(Twist, T_AUTO, lambda m: hub.set(T_AUTO, "auto", [m.linear.x, m.angular.z]), best_effort)
             sub(Twist, T_DRIVE, lambda m: hub.set(T_DRIVE, "drive", [m.linear.x, m.angular.z]), best_effort)
             sub(String, T_MODE, lambda m: hub.set(T_MODE, "mode", m.data), mode_qos)
@@ -603,6 +634,11 @@ class FakeRobot:
                 hub.event("[fake drive] %s" % ("ARMED" if a else "DISARMED"))
             hub.set(T_OFFSET, "offset", offset)
             hub.set(T_VIEW, "view_ok", view_ok)
+            src = "ir" if (t % 30.0) > 22.0 else "color"
+            hub.on_status(json.dumps(dict(
+                source=src, confidence=round(0.5 + 0.4 * math.cos(t / 3.0), 3) if view_ok else 0.0,
+                reason="ok" if view_ok else "blurry", bright=110.0 if src == "color" else 40.0,
+                lap_var=650.0, degrade=0)))
             hub.set(T_AUTO, "auto", auto)
             hub.set(T_DRIVE, "drive", drive)
             hub.set(T_MODE, "mode", self.mode)
