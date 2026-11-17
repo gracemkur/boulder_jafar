@@ -156,6 +156,7 @@
     <div class="kv">
       <div>line offset</div><div><span id="v-off">–</span><div class="bar"><i id="bar-off"></i></div></div>
       <div>view_ok</div><div id="v-view">–</div>
+      <div>camera</div><div id="v-status">–</div>
       <div>/cmd/auto</div><div><span id="v-auto">–</span><div class="bar"><i id="bar-auto"></i></div></div>
       <div>/cmd/drive</div><div><span id="v-drive">–</span><div class="bar"><i id="bar-drive"></i></div></div>
     </div>
@@ -410,6 +411,15 @@ function onState() {
   const v = $("v-view");
   v.textContent = s.view_ok === null ? "–" : String(s.view_ok);
   v.style.color = s.view_ok ? "var(--ok)" : "var(--bad)";
+  const st = s.status;
+  if (!st || stale("/perception/status", 2)) {
+    $("v-status").textContent = "– (no /perception/status: older camera_node?)";
+    $("v-status").style.color = "var(--dim)";
+  } else {
+    const src = String(st.source || "?").toUpperCase();
+    $("v-status").textContent = `${src} · conf ${isFinite(st.confidence) ? (+st.confidence).toFixed(2) : "–"} · ${st.reason || ""}`;
+    $("v-status").style.color = src === "IR" ? "var(--warn)" : "";
+  }
   const a = s.auto, d = s.drive;
   $("v-auto").textContent = a ? `thr ${fmt(a[0])}  steer ${fmt(a[1])}` : "–";
   $("v-drive").textContent = d ? `thr ${fmt(d[0])}  steer ${fmt(d[1])}` : "–";

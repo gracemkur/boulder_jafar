@@ -14,6 +14,7 @@ Subscribes
   /scan                               sensor_msgs/LaserScan        RPLidar
   /perception/line_offset             std_msgs/Float32
   /perception/view_ok                 std_msgs/Bool
+  /perception/status                  std_msgs/String  JSON: source (color|ir), confidence, reason
   /cmd/auto  /cmd/drive               geometry_msgs/Twist
   /mode                               std_msgs/String  (control_node, transient-local)
   /drive/armed                        std_msgs/Bool    (drive_node)
@@ -71,11 +72,13 @@ T_IMG = "/perception/debug_image/compressed"
 T_SCAN = "/scan"
 T_OFFSET = "/perception/line_offset"
 T_VIEW = "/perception/view_ok"
+T_STATUS = "/perception/status"
 T_AUTO = "/cmd/auto"
 T_DRIVE = "/cmd/drive"
 T_MODE = "/mode"
 T_ARMED = "/drive/armed"
-TOPICS = [T_IMG, T_SCAN, T_OFFSET, T_VIEW, T_AUTO, T_DRIVE, T_MODE, T_ARMED]
+TOPICS = [T_IMG, T_SCAN, T_OFFSET, T_VIEW, T_STATUS, T_AUTO, T_DRIVE, T_MODE, T_ARMED]
+STATUS_KEYS = ("source", "confidence", "reason", "bright", "lap_var", "degrade")
 MODE_REQUESTS = ("manual", "auto", "assist", "resume")
 
 
@@ -125,6 +128,7 @@ class Hub:
         self.scan_seq = 0
         self.offset = None
         self.view_ok = None
+        self.status = None        # subset of camera_node's /perception/status JSON
         self.auto = None          # [thr, steer]
         self.drive = None         # [thr, steer]
         self.mode = None
@@ -166,6 +170,15 @@ class Hub:
         with self.lock:
             setattr(self, attr, value)
             self._mark(topic)
+
+    def on_status(self, text):
+        """camera_node's /perception/status JSON. Keep only known keys; ignore garbage."""
+        try:
+            d = json.loads(text)
+        except ValueError:
+            return
+        if isinstance(d, dict):
+            self.set(T_STATUS, "status", {k: d.get(k) for k in STATUS_KEYS})
 
     def on_image(self, jpeg):
         with self.frame_cond:
@@ -288,7 +301,7 @@ class Hub:
                 fake=self.fake, mode=self.mode, armed=self.armed,
                 offset=off if (off is not None and math.isfinite(off)) else None,
                 offset_nan=off is not None and not math.isfinite(off),
-                view_ok=self.view_ok, auto=self.auto, drive=self.drive,
+                view_ok=self.view_ok, status=self.status, auto=self.auto, drive=self.drive,
                 ages={t: (round(now - self.last[t], 2) if t in self.last else None) for t in TOPICS},
                 hz={t: round(self.rates[t].hz(now), 1) for t in TOPICS},
                 cap=self.max_throttle, other_manual=self.other_manual,
@@ -476,6 +489,7 @@ def run_ros(p, hub, stop):
             sub(LaserScan, T_SCAN, self.on_scan, best_effort)
             sub(Float32, T_OFFSET, lambda m: hub.set(T_OFFSET, "offset", float(m.data)), best_effort)
             sub(Bool, T_VIEW, lambda m: hub.set(T_VIEW, "view_ok", bool(m.data)), best_effort)
+            sub(String, T_STATUS, lambda m: hub.on_status(m.data), best_effort)
             sub(Twist, T_AUTO, lambda m: hub.set(T_AUTO, "auto", [m.linear.x, m.angular.z]), best_effort)
             sub(Twist, T_DRIVE, lambda m: hub.set(T_DRIVE, "drive", [m.linear.x, m.angular.z]), best_effort)
             sub(String, T_MODE, lambda m: hub.set(T_MODE, "mode", m.data), mode_qos)
@@ -620,6 +634,11 @@ class FakeRobot:
                 hub.event("[fake drive] %s" % ("ARMED" if a else "DISARMED"))
             hub.set(T_OFFSET, "offset", offset)
             hub.set(T_VIEW, "view_ok", view_ok)
+            src = "ir" if (t % 30.0) > 22.0 else "color"
+            hub.on_status(json.dumps(dict(
+                source=src, confidence=round(0.5 + 0.4 * math.cos(t / 3.0), 3) if view_ok else 0.0,
+                reason="ok" if view_ok else "blurry", bright=110.0 if src == "color" else 40.0,
+                lap_var=650.0, degrade=0)))
             hub.set(T_AUTO, "auto", auto)
             hub.set(T_DRIVE, "drive", drive)
             hub.set(T_MODE, "mode", self.mode)
