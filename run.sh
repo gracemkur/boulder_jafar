@@ -6,25 +6,34 @@
 #   bash run.sh attach    attach to the session (tmux prefix on this Pi is Ctrl-a; Ctrl-a d detaches)
 #   bash run.sh stop      Ctrl-C drive first (neutral + disarm), then everything else, then kill session
 #
-# Windows: drive | cam | auto | ctl | mon
+# Windows: drive | lidar | cam | auto | ctl | mon
 #
 # Overrides (environment variables):
-#   DRIVE_DIR CAM_DIR CTL_DIR      default ~/robo-drive ~/robo-cam ~/robo-ctl
+#   DRIVE_DIR CAM_DIR CTL_DIR      default: the folder this script is in (merged repo)
 #   DRIVE_ARGS CAM_ARGS AUTO_ARGS  extra args, e.g. DRIVE_ARGS="--steer-sign -1 --port /dev/ttyACM1"
-#   CTL_NODES                      space-separated control scripts (default: every $CTL_DIR/*_node.py)
+#                                  CAM_ARGS="--line light --thresh 155"
+#   CTL_NODES                      space-separated control scripts
+#                                  (default: $CTL_DIR/*_node.py except drive/auto/camera nodes)
 #   ARM=1                          pass --arm to drive_node
+#   LIDAR=0                        don't start the RPLidar driver
+#   LIDAR_PORT                     default /dev/ttyUSB0
+#   LIDAR_SETUP                    workspace providing rplidar_ros (default ~/ros2-racer/install/setup.bash)
 
 set -u
 
 SESSION=floodbot
 ROS_SETUP=/opt/ros/humble/setup.bash
-DRIVE_DIR=${DRIVE_DIR:-$HOME/robo-drive}
-CAM_DIR=${CAM_DIR:-$HOME/robo-cam}
-CTL_DIR=${CTL_DIR:-$HOME/robo-ctl}
+REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DRIVE_DIR=${DRIVE_DIR:-$REPO_DIR}
+CAM_DIR=${CAM_DIR:-$REPO_DIR}
+CTL_DIR=${CTL_DIR:-$REPO_DIR}
 DRIVE_ARGS=${DRIVE_ARGS:-}
 CAM_ARGS=${CAM_ARGS:-}
 AUTO_ARGS=${AUTO_ARGS:-}
 ARM=${ARM:-0}
+LIDAR=${LIDAR:-1}
+LIDAR_PORT=${LIDAR_PORT:-/dev/ttyUSB0}
+LIDAR_SETUP=${LIDAR_SETUP:-$HOME/ros2-racer/install/setup.bash}
 
 die()  { echo "run.sh: ERROR: $*" >&2; exit 1; }
 warn() { echo "run.sh: warning: $*" >&2; }
@@ -58,7 +67,15 @@ preflight() {
     fi
   done
   [ "$found" = 1 ] || warn "no /dev/ttyACM* device: Pixhawk not connected? drive_node will fail."
-  [ -e /dev/ttyUSB0 ] || warn "/dev/ttyUSB0 (RPLidar) not present."
+  if [ "$LIDAR" = 1 ]; then
+    [ -e "$LIDAR_PORT" ] || warn "$LIDAR_PORT (RPLidar) not present: lidar window will fail."
+    [ -f "$LIDAR_SETUP" ] || warn "$LIDAR_SETUP not found: rplidar_ros may not be found (set LIDAR_SETUP=...)."
+    # Only one process may own the lidar serial port.
+    if pgrep -af 'rplidar_node' | grep -v pgrep >/dev/null; then
+      pgrep -af 'rplidar_node' | grep -v pgrep >&2
+      die "an rplidar driver is already running (above). Ctrl-C it first, or use LIDAR=0."
+    fi
+  fi
   if pgrep -af 'realsense|camera_node\.py' | grep -v pgrep >/dev/null; then
     warn "something may already hold the RealSense: $(pgrep -af 'realsense|camera_node\.py' | grep -v pgrep | head -1)"
   fi
@@ -79,14 +96,21 @@ start() {
   tmux new-session -d -s "$SESSION" -n drive -c "$DRIVE_DIR"
   pane_run "$SESSION:drive" "python3 $DRIVE_DIR/drive_node.py $drive_args"
 
+  if [ "$LIDAR" = 1 ]; then
+    tmux new-window -t "$SESSION" -n lidar -c "$REPO_DIR"
+    local lidar_src=""
+    [ -f "$LIDAR_SETUP" ] && lidar_src="source $LIDAR_SETUP && "
+    pane_run "$SESSION:lidar" "${lidar_src}ros2 launch rplidar_ros rplidar_a1_launch.py serial_port:=$LIDAR_PORT"
+  fi
+
   tmux new-window -t "$SESSION" -n cam -c "$CAM_DIR"
   pane_run "$SESSION:cam" "python3 $CAM_DIR/camera_node.py $CAM_ARGS"
 
   tmux new-window -t "$SESSION" -n auto -c "$DRIVE_DIR"
   pane_run "$SESSION:auto" "python3 $DRIVE_DIR/auto_node.py $AUTO_ARGS"
 
-  # control nodes (Person C). Not written yet -> placeholder.
-  local ctl_nodes="${CTL_NODES:-$(ls "$CTL_DIR"/*_node.py 2>/dev/null | tr '\n' ' ')}"
+  # control nodes (Person C). Skip the nodes launched above, which share this folder in the merged repo.
+  local ctl_nodes="${CTL_NODES:-$(ls "$CTL_DIR"/*_node.py 2>/dev/null | grep -vE '/(drive|auto|camera)_node\.py$' | tr '\n' ' ')}"
   tmux new-window -t "$SESSION" -n ctl -c "$CTL_DIR"
   if [ -z "${ctl_nodes// /}" ]; then
     tmux send-keys -t "$SESSION:ctl" "echo 'No control nodes in $CTL_DIR (set CTL_NODES=...). Nothing publishes /cmd/drive, so drive stays neutral.'" C-m
@@ -106,7 +130,7 @@ start() {
   pane_run "$SESSION:mon" "ros2 topic echo /cmd/auto"
 
   tmux select-window -t "$SESSION:drive"
-  echo "run.sh: started session '$SESSION' (windows: drive cam auto ctl mon)."
+  echo "run.sh: started session '$SESSION' (windows: $(tmux list-windows -t "$SESSION" -F '#W' | tr '\n' ' '))."
   echo "        attach: bash run.sh attach    stop: bash run.sh stop"
 }
 
