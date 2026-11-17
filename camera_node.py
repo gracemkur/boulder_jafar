@@ -288,6 +288,57 @@ def find_line(gray_small, p, is_ir=False):
     min_area = p.min_area * SCALE * SCALE
     best, best_conf, best_why = None, 0.0, "no-line"
     blob_mask = np.zeros_like(mask)
+
+    def centerline_angle(c):
+        """Angle from vertical of the line through each row's middle (robust for short, wide pieces)."""
+        blob_mask[:] = 0
+        cv2.drawContours(blob_mask, [c], -1, 255, -1)
+        ys, xs = np.nonzero(blob_mask)
+        rows = np.unique(ys)
+        if rows.size < 3:
+            return 90.0
+        centers = np.array([xs[ys == r].mean() for r in rows])
+        slope = np.polyfit(rows.astype(np.float64), centers, 1)[0]  # dx per dy
+        return abs(math.degrees(math.atan(slope)))
+
+    def shape(c, reached_before=False, trimmed=False):
+        """Shape stats + pass/fail for one contour (analysis coords inside the ROI)."""
+        a = cv2.contourArea(c)
+        x, y, bw, bh = cv2.boundingRect(c)
+        span = bh / float(rh)
+        reaches = reached_before or (y + bh >= rh * (1.0 - p.bottom_gap)) or x <= 1 or x + bw >= w - 1
+        m = cv2.moments(c)
+        if m["m00"] <= 0:
+            return None
+        if trimmed:
+            # every row of a trimmed piece is already tape-width, so its centre line is the tape direction
+            ang = centerline_angle(c)
+        else:
+            # principal axis angle measured from vertical (0 = straight ahead, 90 = across the view)
+            theta = 0.5 * math.atan2(2.0 * m["mu11"], m["mu20"] - m["mu02"])  # from x axis
+            ang = abs(90.0 - abs(math.degrees(theta)))
+        mean_w = a / max(bh, 1)
+        (_, _), (rw, rhh), _ = cv2.minAreaRect(c)
+        fill = a / max(rw * rhh, 1.0)
+        ok = reaches and span >= p.min_span and ang <= p.max_angle and mean_w <= p.max_width * w \
+            and fill >= p.min_fill
+        return dict(ok=ok, a=a, span=span, ang=ang, fill=fill, m=m, reaches=reaches)
+
+    def trim_wide_rows(c):
+        """Tape touching another light object (a paper roll, a wall edge) merges into one blob that
+        fails the shape test. Drop the rows where the blob is wider than tape can be and keep the
+        largest remaining piece; the caller re-tests its shape."""
+        blob_mask[:] = 0
+        cv2.drawContours(blob_mask, [c], -1, 255, -1)
+        widths = np.count_nonzero(blob_mask, axis=1)
+        wide = widths > p.max_row_width * w
+        if not wide.any():
+            return None
+        blob_mask[wide, :] = 0
+        cs, _ = cv2.findContours(blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cs = [k for k in cs if cv2.contourArea(k) >= min_area]
+        return max(cs, key=cv2.contourArea) if cs else None
+
     for c in contours:
         a = cv2.contourArea(c)
         if a < min_area:
@@ -295,23 +346,19 @@ def find_line(gray_small, p, is_ir=False):
         if a > p.max_area_frac * roi_area:
             best_why = "blob-too-big"
             continue
-        x, y, bw, bh = cv2.boundingRect(c)
-        span = bh / float(rh)
-        reaches = (y + bh >= rh * (1.0 - p.bottom_gap)) or x <= 1 or x + bw >= w - 1
-        m = cv2.moments(c)
-        if m["m00"] <= 0:
+        s = shape(c)
+        if s is None:
             continue
-        # principal axis angle measured from vertical (0 = straight ahead, 90 = across the view)
-        theta = 0.5 * math.atan2(2.0 * m["mu11"], m["mu20"] - m["mu02"])  # from x axis
-        ang = abs(90.0 - abs(math.degrees(theta)))
-        mean_w = a / max(bh, 1)
-        (_, _), (rw, rhh), _ = cv2.minAreaRect(c)
-        fill = a / max(rw * rhh, 1.0)
-        if not reaches or span < p.min_span or ang > p.max_angle or mean_w > p.max_width * w \
-                or fill < p.min_fill:
-            if best is None:
-                best_why = "no-line-shape"
-            continue
+        trimmed = False
+        if not s["ok"]:
+            t = trim_wide_rows(c)
+            s2 = shape(t, reached_before=s["reaches"], trimmed=True) if t is not None else None
+            if s2 is None or not s2["ok"]:
+                if best is None:
+                    best_why = "no-line-shape"
+                continue
+            c, s, trimmed = t, s2, True
+        a, span, ang, fill, m = s["a"], s["span"], s["ang"], s["fill"], s["m"]
         blob_mask[:] = 0
         cv2.drawContours(blob_mask, [c], -1, 255, -1)
         zc = cv2.mean(z, mask=blob_mask)[0]
@@ -325,6 +372,8 @@ def find_line(gray_small, p, is_ir=False):
         angle_s = _clip01(1.0 - max(0.0, ang - 30.0) / max(p.max_angle - 30.0, 1.0))
         fill_s = _clip01(fill / 0.7)
         conf = 0.2 + 0.4 * contrast_s + 0.2 * span_s + 0.1 * angle_s + 0.1 * fill_s
+        if trimmed:
+            conf *= 0.85  # part of the blob was cut away: trust it a bit less
         conf = _clip01(conf)
         if conf > best_conf:
             best, best_conf = c, conf
@@ -342,7 +391,10 @@ def find_line(gray_small, p, is_ir=False):
     if best_conf < p.min_conf:
         res["why"] = "low-conf"
         return res
-    res["offset"] = max(-1.0, min(1.0, (cx - w / 2.0) / (w / 2.0)))
+    off = (cx - w / 2.0) / (w / 2.0)
+    if is_ir:
+        off *= p.ir_offset_scale  # IR imager sees wider than color: rescale so offsets match at a switch
+    res["offset"] = max(-1.0, min(1.0, off))
     res["why"] = "line"
     return res
 
@@ -713,10 +765,16 @@ def parse_args(argv=None):
     ap.add_argument("--max-area-frac", type=float, default=0.6,
                     help="reject blobs bigger than this fraction of the ROI (floor/shadow, not tape)")
     ap.add_argument("--min-span", type=float, default=0.3, help="blob must cover this fraction of ROI height")
-    ap.add_argument("--bottom-gap", type=float, default=0.3,
+    ap.add_argument("--bottom-gap", type=float, default=0.4,
                     help="blob must reach the bottom (this fraction) of the ROI or a side edge")
     ap.add_argument("--max-angle", type=float, default=60.0, help="max tilt of the tape axis from vertical (deg)")
     ap.add_argument("--max-width", type=float, default=0.45, help="max mean blob width as fraction of image width")
+    ap.add_argument("--ir-offset-scale", type=float, default=1.6,
+                    help="multiply IR offsets by this so they match color offsets (IR field of view is wider; "
+                         "1.6 measured on the car: same tape gave +0.365 color vs +0.215 IR)")
+    ap.add_argument("--max-row-width", type=float, default=0.25,
+                    help="if a blob fails the shape test, drop rows wider than this (fraction of image width) "
+                         "and re-test; recovers tape touching another light object")
     ap.add_argument("--min-fill", type=float, default=0.35, help="min blob area / minAreaRect area")
     ap.add_argument("--blur-min", type=float, default=60.0, help="color: Laplacian variance below this = blurry")
     ap.add_argument("--bright-min", type=float, default=30.0, help="color: mean gray below this = too dark")
