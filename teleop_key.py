@@ -67,7 +67,7 @@ class Teleop(Node):
     def request(self, text):
         self.pub_req.publish(String(data=text))
 
-    def handle(self, ch):
+    def on_key(self, ch):
         c = ch.lower()
         if c == " ":
             self.thr = self.steer = 0.0
@@ -126,7 +126,7 @@ def main():
                 ch = sys.stdin.read(1)
                 if ch.lower() == "q":
                     break
-                node.handle(ch)
+                node.on_key(ch)
             now = time.monotonic()
             if now >= next_pub:
                 node.send_cmd()
