@@ -111,6 +111,8 @@ class Pixhawk:
         self.mode = "?"
         self.version = None
         self.acks = []
+        self.servo = None        # last SERVO_OUTPUT_RAW (port 0): actual pulses the Pixhawk outputs
+        self.servo_t = 0.0
 
     # ---- connection
     def connect(self, baud, timeout=10.0):
@@ -160,6 +162,9 @@ class Pixhawk:
                 self.acks.append(msg)
             elif t == "AUTOPILOT_VERSION":
                 self.version = msg
+            elif t == "SERVO_OUTPUT_RAW" and getattr(msg, "port", 0) == 0:
+                self.servo = msg
+                self.servo_t = time.monotonic()
 
     # ---- info
     @property
@@ -206,6 +211,21 @@ class Pixhawk:
                                 self.m.MAVLINK_MSG_ID_AUTOPILOT_VERSION, 0, 0, 0, 0, 0, 0)
         c.mav.command_long_send(c.target_system, c.target_component,
                                 self.m.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, 0, 1, 0, 0, 0, 0, 0, 0)
+
+    def request_servo_output(self, hz=4.0):
+        """Ask for SERVO_OUTPUT_RAW so we can log the real steering/throttle pulses (read-only)."""
+        c = self.conn
+        c.mav.command_long_send(c.target_system, c.target_component,
+                                self.m.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                                self.m.MAVLINK_MSG_ID_SERVO_OUTPUT_RAW, int(1e6 / hz), 0, 0, 0, 0, 0)
+
+    def servo_string(self):
+        """'servo1=1485us servo3=1500us' (1 = steering, 3 = throttle on this car), or why not."""
+        if self.servo is None:
+            return "servo=? (no SERVO_OUTPUT_RAW)"
+        age = time.monotonic() - self.servo_t
+        return "servo1=%dus servo3=%dus%s" % (self.servo.servo1_raw, self.servo.servo3_raw,
+                                              "" if age < 2.0 else " (%.0fs old)" % age)
 
     def set_mode(self, name, timeout=3.0):
         """Blocking mode change (only called at startup, while disarmed). Returns True on confirm."""
@@ -372,6 +392,10 @@ def run_ros(p):
             if px.armed and not p.arm:
                 self.log.warn("Pixhawk was already ARMED at startup and --arm not given: disarming.")
                 px.send_arm(False)
+            try:
+                px.request_servo_output()
+            except Exception as e:
+                self.log.warn("could not request SERVO_OUTPUT_RAW: %s" % e)
             self.t_connect = time.monotonic()
 
             self.create_subscription(Twist, p.topic, self.on_cmd, 10)
@@ -502,6 +526,8 @@ def run_ros(p):
                 self.log.info("Pixhawk link back")
             try:
                 self.px.send_gcs_heartbeat()
+                if now - self.px.servo_t > 3.0:   # stream not running (yet): ask again
+                    self.px.request_servo_output()
             except Exception:
                 pass
             self.pub_armed.publish(Bool(data=bool(self.px.armed)))
@@ -509,10 +535,11 @@ def run_ros(p):
         def log_tick(self):
             now = time.monotonic()
             age = self.cmd_age(now)
-            self.log.info("armed=%s mode=%s link=%s cmd_age=%s thr=%+.2f steer=%+.2f -> y=%d z=%d"
+            self.log.info("armed=%s mode=%s link=%s cmd_age=%s thr=%+.2f steer=%+.2f -> y=%d z=%d | %s"
                           % (self.px.armed, self.px.mode, "ok" if self.link_ok else "LOST",
                              "never" if age == float("inf") else "%.2fs" % age,
-                             self.cmd[0], self.cmd[1], self.out[0], self.out[1]))
+                             self.cmd[0], self.cmd[1], self.out[0], self.out[1],
+                             self.px.servo_string()))
 
     px = None
     node = None
