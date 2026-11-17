@@ -29,6 +29,7 @@ to the console and to a CSV file (for the G3 "who controls the car and why").
 import csv
 import math
 import os
+import signal
 import time
 from datetime import datetime
 
@@ -303,20 +304,39 @@ def main():
                 self._publish_mode()
 
         def shutdown(self):
-            self._log_event("SHUTDOWN", self.arb.mode, STOP, "control_node exiting")
-            for _ in range(5):
-                self.pub_drive.publish(Twist())
-                time.sleep(0.02)
-            self._csv_f.close()
+            try:
+                self._log_event("SHUTDOWN", self.arb.mode, STOP, "control_node exiting")
+                for _ in range(5):
+                    self.pub_drive.publish(Twist())
+                    time.sleep(0.02)
+            finally:
+                self._csv_f.close()   # always close the CSV, even if a publish fails
 
-    rclpy.init()
+    # Handle Ctrl-C / kill ourselves so the ROS context is still alive while shutdown()
+    # publishes the final zeros and logs SHUTDOWN (rclpy's default handler tears it down first).
+    stop = {"flag": False}
+
+    def _on_signal(signum, frame):
+        stop["flag"] = True
+
+    try:
+        from rclpy.signals import SignalHandlerOptions
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    except (ImportError, TypeError):
+        rclpy.init()
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _on_signal)
+
     node = ControlNode()
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        while not stop["flag"] and rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
     finally:
-        node.shutdown()
+        try:
+            node.shutdown()
+        except Exception as e:
+            print("[control_node] shutdown error: %s" % e, flush=True)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

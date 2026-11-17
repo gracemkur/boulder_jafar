@@ -6,7 +6,8 @@
 #   bash run.sh attach    attach to the session (tmux prefix on this Pi is Ctrl-a; Ctrl-a d detaches)
 #   bash run.sh stop      Ctrl-C drive first (neutral + disarm), then everything else, then kill session
 #
-# Windows: drive | lidar | cam | auto | ctl | mon
+# Windows: drive | lidar | cam | auto | ctl | dash | mon
+#   dash = web dashboard (camera, lidar, wheel tests, autonomy) on http://<pi-ip>:8080
 #
 # Overrides (environment variables):
 #   DRIVE_DIR CAM_DIR CTL_DIR      default: the folder this script is in (merged repo)
@@ -18,6 +19,8 @@
 #   LIDAR=0                        don't start the RPLidar driver
 #   LIDAR_PORT                     default /dev/ttyUSB0
 #   LIDAR_SETUP                    workspace providing rplidar_ros (default ~/ros2-racer/install/setup.bash)
+#   DASH=0                         don't start the web dashboard
+#   DASH_ARGS                      e.g. DASH_ARGS="--port 8081 --max-throttle 0.15"
 
 set -u
 
@@ -34,6 +37,8 @@ ARM=${ARM:-0}
 LIDAR=${LIDAR:-1}
 LIDAR_PORT=${LIDAR_PORT:-/dev/ttyUSB0}
 LIDAR_SETUP=${LIDAR_SETUP:-$HOME/ros2-racer/install/setup.bash}
+DASH=${DASH:-1}
+DASH_ARGS=${DASH_ARGS:-}
 
 die()  { echo "run.sh: ERROR: $*" >&2; exit 1; }
 warn() { echo "run.sh: warning: $*" >&2; }
@@ -110,7 +115,7 @@ start() {
   pane_run "$SESSION:auto" "python3 $DRIVE_DIR/auto_node.py $AUTO_ARGS"
 
   # control nodes (Person C). Skip the nodes launched above, which share this folder in the merged repo.
-  local ctl_nodes="${CTL_NODES:-$(ls "$CTL_DIR"/*_node.py 2>/dev/null | grep -vE '/(drive|auto|camera)_node\.py$' | tr '\n' ' ')}"
+  local ctl_nodes="${CTL_NODES:-$(ls "$CTL_DIR"/*_node.py 2>/dev/null | grep -vE '/(drive|auto|camera|dashboard)_node\.py$' | tr '\n' ' ')}"
   tmux new-window -t "$SESSION" -n ctl -c "$CTL_DIR"
   if [ -z "${ctl_nodes// /}" ]; then
     tmux send-keys -t "$SESSION:ctl" "echo 'No control nodes in $CTL_DIR (set CTL_NODES=...). Nothing publishes /cmd/drive, so drive stays neutral.'" C-m
@@ -124,6 +129,11 @@ start() {
     tmux select-layout -t "$SESSION:ctl" tiled >/dev/null
   fi
 
+  if [ "$DASH" = 1 ]; then
+    tmux new-window -t "$SESSION" -n dash -c "$REPO_DIR"
+    pane_run "$SESSION:dash" "python3 $REPO_DIR/dashboard_node.py $DASH_ARGS"
+  fi
+
   tmux new-window -t "$SESSION" -n mon -c "$DRIVE_DIR"
   pane_run "$SESSION:mon" "ros2 topic echo /cmd/drive"
   tmux split-window -t "$SESSION:mon" -h -c "$DRIVE_DIR"
@@ -132,6 +142,10 @@ start() {
   tmux select-window -t "$SESSION:drive"
   echo "run.sh: started session '$SESSION' (windows: $(tmux list-windows -t "$SESSION" -F '#W' | tr '\n' ' '))."
   echo "        attach: bash run.sh attach    stop: bash run.sh stop"
+  if [ "$DASH" = 1 ]; then
+    echo "        dashboard: http://$(hostname -I 2>/dev/null | awk '{print $1}'):8080  (or the --port in DASH_ARGS)"
+    echo "        drive from the dashboard OR teleop_key.py, not both (the dashboard refuses while teleop runs)."
+  fi
 }
 
 stop() {

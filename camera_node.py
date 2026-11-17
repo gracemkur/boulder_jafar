@@ -6,6 +6,10 @@ Contract (do not rename):
   /perception/line_offset  std_msgs/Float32  -1.0 far left .. 0.0 center .. +1.0 far right, NaN = no line
   /perception/view_ok      std_msgs/Bool     True = image usable, False = too blurred / dark / occluded
 
+Extra (for the dashboard, not part of the contract):
+  /perception/debug_image/compressed  sensor_msgs/CompressedImage  annotated JPEG (tape outline,
+      offset, view_ok). Only encoded while something subscribes. --image-hz 0 turns it off.
+
 Modes:
   python3 camera_node.py                 # ROS 2 node, ~15 Hz (source /opt/ros/humble/setup.bash first)
   python3 camera_node.py --test          # no ROS: grab one frame, print offset + view_ok, save debug.jpg
@@ -21,6 +25,7 @@ Useful options (work in every mode):
 """
 
 import argparse
+import array
 import math
 import os
 import sys
@@ -234,6 +239,26 @@ def run_test(p):
     print("debug image saved to %s" % p.debug_path)
 
 
+IMAGE_TOPIC = "/perception/debug_image/compressed"
+
+
+def publish_debug_image(node, pub, img, p):
+    """JPEG-encode the annotated frame and publish it as sensor_msgs/CompressedImage."""
+    from sensor_msgs.msg import CompressedImage
+    h, w = img.shape[:2]
+    if p.image_width < w:
+        img = cv2.resize(img, (p.image_width, int(h * p.image_width / w)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, p.image_quality])
+    if not ok:
+        return
+    msg = CompressedImage()
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.header.frame_id = "camera"
+    msg.format = "jpeg"
+    msg.data = array.array("B", buf.tobytes())
+    pub.publish(msg)
+
+
 def run_ros(p):
     import rclpy
     from rclpy.node import Node
@@ -243,6 +268,13 @@ def run_ros(p):
     node = Node("camera_node")
     pub_off = node.create_publisher(Float32, "/perception/line_offset", 10)
     pub_ok = node.create_publisher(Bool, "/perception/view_ok", 10)
+    pub_img = None
+    if p.image_hz > 0:
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from sensor_msgs.msg import CompressedImage
+        pub_img = node.create_publisher(CompressedImage, IMAGE_TOPIC,
+                                        QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+    last_img = 0.0
     log = node.get_logger()
 
     cam = RealSenseCamera()
@@ -275,6 +307,11 @@ def run_ros(p):
             frame, info, contour, centroid, top = process(frame, p, steps)
             pub_off.publish(Float32(data=float(info["offset"])))
             pub_ok.publish(Bool(data=bool(info["view_ok"])))
+
+            if (pub_img is not None and now - last_img >= 1.0 / p.image_hz
+                    and node.count_subscribers(IMAGE_TOPIC) > 0):
+                last_img = now
+                publish_debug_image(node, pub_img, draw_debug(frame, info, contour, centroid, top), p)
 
             if p.debug_every >= 0 and now - last_debug >= p.debug_every:
                 save_debug(draw_debug(frame, info, contour, centroid, top), p.debug_path)
@@ -313,6 +350,10 @@ def parse_args(argv=None):
     ap.add_argument("--ramp", type=float, default=0.0,
                     help="(ROS mode) cycle degrade 0..N, advancing one step every RAMP seconds")
     ap.add_argument("--debug-path", default=DEFAULT_DEBUG_PATH)
+    ap.add_argument("--image-hz", type=float, default=10.0,
+                    help="(ROS mode) max rate of %s for the dashboard; 0 = off" % IMAGE_TOPIC)
+    ap.add_argument("--image-width", type=int, default=640, help="downscale the dashboard image to this width")
+    ap.add_argument("--image-quality", type=int, default=70, help="JPEG quality 1-100 for the dashboard image")
     ap.add_argument("--debug-every", type=float, default=1.0,
                     help="(ROS mode) seconds between debug.jpg saves; -1 = never")
     # ignore ROS args (e.g. --ros-args ...) if someone passes them

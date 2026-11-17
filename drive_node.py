@@ -7,6 +7,8 @@ Contract (do not rename):
                 linear.x  = throttle  -1.0 full reverse .. +1.0 full forward
                 angular.z = steer     -1.0 full right   .. +1.0 full LEFT
   publishes  /drive/armed std_msgs/Bool   Pixhawk armed state (2 Hz)
+  subscribes /drive/arm_request std_msgs/Bool   True = arm (same checks as --arm), False = disarm now
+                                                (sent by dashboard_node.py)
 
 Talks to the Pixhawk 4 Mini over USB with pymavlink, the same way the course
 rover_node does (~/ros2-racer/src/robo_rover/robo_rover/rover_node.py):
@@ -14,8 +16,9 @@ wait for heartbeat -> set mode -> arm -> stream MANUAL_CONTROL at 20 Hz with
 y = steering, z = throttle (0 = neutral, +-1000 = full).
 
 SAFETY
-  * Starts DISARMED and streams neutral. Arms only with --arm, >= 1 s after
-    connecting, and only while /cmd/drive is neutral or absent. Never force-arms.
+  * Starts DISARMED and streams neutral. Arms only with --arm or a True on
+    /drive/arm_request, >= 1 s after connecting, and only while /cmd/drive is
+    neutral or absent. Never force-arms. A False on /drive/arm_request disarms.
   * While disarmed it always sends neutral, whatever /cmd/drive says.
   * /cmd/drive older than --stale (default 0.3 s), or never received -> neutral.
   * Ctrl-C / SIGTERM / SIGHUP (tmux kill) / crash -> neutral x5, disarm, close.
@@ -372,6 +375,7 @@ def run_ros(p):
             self.t_connect = time.monotonic()
 
             self.create_subscription(Twist, p.topic, self.on_cmd, 10)
+            self.create_subscription(Bool, "/drive/arm_request", self.on_arm_request, 10)
             self.pub_armed = self.create_publisher(Bool, "/drive/armed", 10)
             self.create_timer(1.0 / RATE_HZ, self.control_tick)
             self.create_timer(0.02, self.recv_tick)
@@ -388,6 +392,23 @@ def run_ros(p):
         def on_cmd(self, msg):
             self.cmd = (clean(msg.linear.x), clean(msg.angular.z))
             self.cmd_t = time.monotonic()
+
+        def on_arm_request(self, msg):
+            if msg.data:
+                if self.px.armed:
+                    self.log.info("arm requested: already armed")
+                elif self.arm_state in ("waiting", "pending"):
+                    self.log.info("arm requested: already arming")
+                else:
+                    self.log.warn("arm requested via /drive/arm_request")
+                    self.arm_state = "waiting"   # same checks as --arm (ArduPilot, neutral command)
+            else:
+                self.log.warn("DISARM requested via /drive/arm_request")
+                self.arm_state = "off"
+                try:
+                    self.px.send_arm(False)
+                except Exception as e:
+                    self.log.error("disarm send failed: %s" % e)
 
         def cmd_age(self, now):
             return float("inf") if self.cmd_t is None else now - self.cmd_t
@@ -464,6 +485,8 @@ def run_ros(p):
             if self.px.armed != self.prev_armed:
                 if not self.px.armed:
                     self.log.warn("Pixhawk reports DISARMED")
+                    if self.arm_state == "done":
+                        self.arm_state = "off"   # allow re-arming via /drive/arm_request
                 self.prev_armed = self.px.armed
 
         # ---- 2 Hz housekeeping
