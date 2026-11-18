@@ -79,6 +79,31 @@ Useful options (work in every mode):
   --bad-frames N / --good-frames M   view_ok debounce (default 3 / 3)
   --dark-sim F [--dark-noise S]      (--test) scale brightness by F and add Gaussian noise sigma S
   --ir-image FILE        (--test --image) pair an IR frame with the color image
+
+Forks (the tape splits into a "Y"):
+  A fork is seen when the line blob has two separate tape runs (gap >= --fork-gap px at 320x240) in
+  >= --fork-rows of its far rows above a shared stem, or when there are two separate valid line blobs.
+  Such a Y blob is accepted even if it fails the fill test, as long as every single run is tape-width.
+  While a fork is seen the offset follows ONE branch only (aimed with the rows where the branches are
+  already apart, so the car commits; or the leftmost / rightmost blob). Without a fork nothing changes.
+  Fork vs merge: if the gap between the two lines SHRINKS going away from the car, two lines are
+  merging ahead (e.g. a fork's branches rejoining): that is not a fork, and the offset follows the
+  line the car is on (the one nearest the image centre close to the car). The plan is not touched.
+  --fork-plan left,right   side to take at the 1st, 2nd, ... fork (cycles; "left" or "right" alone ok)
+  --fork-enter N (3)       an episode starts after N consecutive fork frames; its side is then fixed
+  --fork-exit N (10)       it ends after N consecutive frames that show a single line (frames with no
+                           line, e.g. while backing up to find it, don't count); then the plan advances
+
+Blur and confidence (G2 "slows or stops"): the reported confidence falls with blur (x1.0 at
+--blur-good 200, x0.4 at --blur-min), so auto_node slows down first; below --blur-min (default 25)
+view_ok goes False and control_node stops the car. On the car: clear ~550, degrade 1 ~41 (slow),
+degrade 2 ~11 and 3 ~5 (stop).
+
+Floor model (color): floor level and noise come from the darker part of each row (10th/35th
+percentile), so a view with lots of tape in it (a fork's V, a close-up) still finds the tape.
+  /perception/fork_reset   std_msgs/Empty (subscribed): plan back to its first entry
+  status adds "fork": bool (seen this frame), "fork_side": "left"|"right"|null (episode side),
+  "fork_count": int (episodes completed). --test treats a seen fork as an episode right away.
 """
 
 import argparse
@@ -250,10 +275,71 @@ def _clip01(x):
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else float(x)
 
 
+def row_runs(mask):
+    """Horizontal runs of nonzero pixels in a 2-D mask: (rows, x0, x1) lists, x1 exclusive, row-major."""
+    h, w = mask.shape
+    pad = np.zeros((h, w + 2), np.int8)
+    pad[:, 1:-1] = mask > 0
+    d = np.diff(pad, axis=1)
+    r0, x0 = np.nonzero(d == 1)
+    _, x1 = np.nonzero(d == -1)
+    return r0, x0, x1
+
+
+def fork_split(mask, p):
+    """
+    Look for a Y (two tape runs side by side in the far rows above a shared stem) in ONE blob mask.
+    Runs closer than --fork-gap are merged; runs narrower than 3 px are ignored next to a real run.
+    Returns None, or dict(left=[(row, x0, x1)...], right=[...], rows=n_fork_rows, max_run=px).
+    """
+    r0, x0, x1 = row_runs(mask)
+    if r0.size == 0 or np.count_nonzero(np.bincount(r0) > 1) < p.fork_rows:
+        return None  # fast exit (every frame): not enough rows with two runs at all
+    per_row = {}
+    for r, a, b in zip(r0.tolist(), x0.tolist(), x1.tolist()):
+        lst = per_row.setdefault(r, [])
+        if lst and a - lst[-1][1] < p.fork_gap:
+            lst[-1][1] = b
+        else:
+            lst.append([a, b])
+    fork_y, stem_y, left, right, max_run = [], [], [], [], 0
+    for r in sorted(per_row):
+        runs = per_row[r]
+        if len(runs) > 1:
+            runs = [k for k in runs if k[1] - k[0] >= 3] or runs
+            # only branch rows count for the width limit: where the branches merge (the point of the
+            # V, close to the car) the single run is legitimately wider than one strip of tape
+            max_run = max(max_run, max(b - a for a, b in runs))
+        (fork_y if len(runs) > 1 else stem_y).append(r)
+        left.append((r, runs[0][0], runs[0][1]))
+        right.append((r, runs[-1][0], runs[-1][1]))
+    if len(fork_y) < p.fork_rows:
+        return None
+    # two runs NEAR the car and one far away = two lines MERGING ahead (e.g. a fork's branches rejoining),
+    # not a fork: the caller follows the run the car is already on instead of choosing a side
+    # decided by how the gap between the two runs changes with distance (row index grows toward the car):
+    # gap shrinking going away from the car = merge; growing = fork. The old "single-run rows are far"
+    # test failed when the car's own branch is alone at the bottom and the other one joins mid-image.
+    sep = {r: per_row[r][-1][0] - per_row[r][0][1] for r in fork_y}
+    rows = np.array(sorted(sep), np.float64)
+    gaps = np.array([sep[int(r)] for r in rows], np.float64)
+    slope = np.polyfit(rows, gaps, 1)[0] if rows.size >= 3 and np.ptp(rows) > 0 else 0.0
+    merge = slope * max(np.ptp(rows), 1.0) > p.fork_gap  # gap at the near end clearly bigger than far
+    # direction of the whole Y: line through the per-row middle between the outer branches
+    ys = np.array([r for r, _, _ in left], np.float64)
+    mid = np.array([(l[1] + rr[2]) * 0.5 for l, rr in zip(left, right)])
+    ang = abs(math.degrees(math.atan(np.polyfit(ys, mid, 1)[0])))
+    return dict(left=left, right=right, rows=len(fork_y), max_run=max_run, ang=ang, fork_rows=set(fork_y),
+                merge=merge)
+
+
 def find_line(gray_small, p, is_ir=False):
     """
     Adaptive tape detector on the 320x240 gray image.
-    Returns dict(offset, confidence, contour (analysis coords, full image), centroid, top, thresh, why).
+    Returns dict(offset, confidence, contour (analysis coords, full image), centroid, top, thresh, why,
+    fork, branches). fork = True when a Y / two line blobs are visible; branches = {"left"|"right":
+    dict(offset, centroid, contour)} for the caller to pick from (offset/centroid stay the whole-blob
+    values, so a caller that ignores forks gets the old behaviour).
     """
     h, w = gray_small.shape
     top = int(h * p.roi_top)
@@ -264,12 +350,27 @@ def find_line(gray_small, p, is_ir=False):
     smf = sm.astype(np.float32)
     rh = roi.shape[0]
 
-    # floor model: per-row median (near rows are brighter/darker than far rows)
-    rowmed = np.median(smf, axis=1)
-    resid = smf - rowmed[:, None]
-    if p.line == "dark":
-        resid = -resid
-    spread = max(float(np.median(np.abs(resid))) * 1.4826, p.min_spread)
+    # floor model per row (near rows are brighter/darker than far rows)
+    if is_ir:
+        # IR (tuned on the car's IR frames): row median and whole-ROI MAD
+        rowmed = np.median(smf, axis=1)
+        resid = smf - rowmed[:, None]
+        if p.line == "dark":
+            resid = -resid
+        spread = float(np.median(np.abs(resid))) * 1.4826
+    else:
+        # color: estimate floor level and noise from the floor side of each row (10th/35th percentile
+        # for light tape). These stay on carpet until tape covers ~65% of a row, so a fork's V or a
+        # close-up of wide tape no longer becomes "the floor". For plain carpet (normal noise) this gives
+        # the same level and scale as a median/MAD: p35 = mu - 0.385 sigma, p35 - p10 = 0.897 sigma.
+        lo, hi = (10, 35) if p.line != "dark" else (90, 65)
+        q_lo, q_hi = np.percentile(smf, [lo, hi], axis=1)
+        sig = np.abs(q_hi - q_lo) / 0.897
+        spread = float(np.median(sig))
+        sgn = 1.0 if p.line != "dark" else -1.0
+        floor = q_hi + sgn * 0.385 * spread
+        resid = sgn * (smf - floor[:, None])
+    spread = max(spread, p.min_spread)
     z = resid * (1.0 / spread)
 
     use_fixed = (not is_ir) and p.thresh is not None
@@ -291,6 +392,7 @@ def find_line(gray_small, p, is_ir=False):
     roi_area = float(rh * w)
     min_area = p.min_area * SCALE * SCALE
     best, best_conf, best_why = None, 0.0, "no-line"
+    best_fork, valid = None, []
     blob_mask = np.zeros_like(mask)
 
     def centerline_angle(c):
@@ -354,6 +456,21 @@ def find_line(gray_small, p, is_ir=False):
         if s is None:
             continue
         trimmed = False
+        fork = None
+        if not s["ok"] and s["reaches"] and s["span"] >= p.min_span:
+            # Y-shaped blob: fill (and the principal axis of an asymmetric Y) fail although each
+            # branch is tape. Accept it if every run (not the whole row) is tape-width.
+            blob_mask[:] = 0
+            cv2.drawContours(blob_mask, [c], -1, 255, -1)
+            bx, by, bw_, bh_ = cv2.boundingRect(c)
+            fork = fork_split(blob_mask[by:by + bh_, bx:bx + bw_], p)
+            if fork is not None and fork["max_run"] <= p.max_row_width * w \
+                    and s["a"] / max(bh_, 1) <= 2.0 * p.max_width * w \
+                    and min(s["ang"], fork["ang"]) <= p.max_angle:
+                fork["dx"], fork["dy"] = bx, by
+                s["ok"] = True
+            else:
+                fork = None
         if not s["ok"]:
             t = trim_wide_rows(c)
             s2 = shape(t, reached_before=s["reaches"], trimmed=True) if t is not None else None
@@ -379,12 +496,13 @@ def find_line(gray_small, p, is_ir=False):
         if trimmed:
             conf *= 0.85  # part of the blob was cut away: trust it a bit less
         conf = _clip01(conf)
+        valid.append((c, conf, m))
         if conf > best_conf:
             best, best_conf = c, conf
-            best_m = m
+            best_m, best_fork = m, fork
 
     res = dict(offset=float("nan"), confidence=0.0, contour=None, centroid=None,
-               top=top, thresh=thresh_desc, why=best_why, spread=spread)
+               top=top, thresh=thresh_desc, why=best_why, spread=spread, fork=False, branches=None)
     if best is None:
         return res
     cx = best_m["m10"] / best_m["m00"]
@@ -395,11 +513,93 @@ def find_line(gray_small, p, is_ir=False):
     if best_conf < p.min_conf:
         res["why"] = "low-conf"
         return res
-    off = (cx - w / 2.0) / (w / 2.0)
-    if is_ir:
-        off *= p.ir_offset_scale  # IR imager sees wider than color: rescale so offsets match at a switch
-    res["offset"] = max(-1.0, min(1.0, off))
+    def norm(x):
+        off = (x - w / 2.0) / (w / 2.0)
+        if is_ir:
+            off *= p.ir_offset_scale  # IR imager sees wider than color: rescale so offsets match at a switch
+        return max(-1.0, min(1.0, off))
+
+    res["offset"] = norm(cx)
     res["why"] = "line"
+
+    # ---- fork: a Y inside the best blob, or two separate valid line blobs
+    lift = np.array([[[0, top]]], dtype=best.dtype)
+    if best_fork is None:
+        blob_mask[:] = 0
+        cv2.drawContours(blob_mask, [best], -1, 255, -1)
+        bx, by, bw_, bh_ = cv2.boundingRect(best)
+        f = fork_split(blob_mask[by:by + bh_, bx:bx + bw_], p)
+        if f is not None and f["max_run"] <= p.max_row_width * w:
+            f["dx"], f["dy"] = bx, by
+            best_fork = f
+    branches = None
+    if best_fork is not None and best_fork.get("merge"):
+        # lines merging ahead: follow the run the car is on = the one nearest the image centre in the
+        # closest row that still has two runs (no fork, the plan is not touched)
+        dx, dy = best_fork["dx"], best_fork["dy"]
+        near = max(best_fork["fork_rows"])
+        lrun = [t for t in best_fork["left"] if t[0] == near][0]
+        rrun = [t for t in best_fork["right"] if t[0] == near][0]
+        dist = lambda t: abs((t[1] + t[2] - 1) * 0.5 + dx - w / 2.0)
+        path = best_fork["left"] if dist(lrun) <= dist(rrun) else best_fork["right"]
+        own = [t for t in path if t[0] in best_fork["fork_rows"]] or path
+        mcx = sum((a + b - 1) * 0.5 for _, a, b in own) / len(own) + dx
+        mcy = sum(r for r, _, _ in own) / float(len(own)) + dy + top
+        res["offset"] = norm(mcx)
+        res["centroid"] = (mcx, mcy)
+        best_fork = None
+    if best_fork is not None:
+        branches = {}
+        dx, dy = best_fork["dx"], best_fork["dy"]
+        for side in ("left", "right"):
+            path = best_fork[side]
+            # aim with the rows where the branches are already apart (not the shared stem), so the car
+            # commits to the chosen branch; the stem still belongs to the drawn outline
+            aim = [t for t in path if t[0] in best_fork["fork_rows"]] or path
+            bcx = sum((a + b - 1) * 0.5 for _, a, b in aim) / len(aim) + dx
+            bcy = sum(r for r, _, _ in aim) / float(len(aim)) + dy + top
+            blob_mask[:] = 0
+            for r, a, b in path:
+                blob_mask[r + dy, a + dx:b + dx] = 255
+            cs, _ = cv2.findContours(blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnt = max(cs, key=cv2.contourArea) + lift if cs else None
+            branches[side] = dict(offset=norm(bcx), centroid=(bcx, bcy), contour=cnt)
+    else:
+        good = [v for v in valid if v[1] >= p.min_conf]
+        if len(good) >= 2:
+            good.sort(key=lambda v: v[2]["m10"] / v[2]["m00"])
+            (cl, _, ml), (cr, _, mr) = good[0], good[-1]
+            xl, yl, wl, hl = cv2.boundingRect(cl)
+            xr, yr, wr, hr = cv2.boundingRect(cr)
+            overlap = min(yl + hl, yr + hr) - max(yl, yr)       # rows both blobs cover
+            if xr - (xl + wl) >= p.fork_gap and overlap >= p.fork_rows:
+                # fork only if the two lines SPREAD APART going away from the car (far rows = small y);
+                # if they come together ahead it is a merge: keep following the line the car is on
+                def row_cx(c, r):
+                    blob_mask[:] = 0
+                    cv2.drawContours(blob_mask, [c], -1, 255, -1)
+                    xs = np.nonzero(blob_mask[r])[0]
+                    return xs.mean() if xs.size else None
+                r_far, r_near = max(yl, yr), min(yl + hl, yr + hr) - 1
+                l_far, r_far_x = row_cx(cl, r_far), row_cx(cr, r_far)
+                l_near, r_near_x = row_cx(cl, r_near), row_cx(cr, r_near)
+                # parallel or spreading = fork (as before); only clearly converging = merge
+                diverge = None in (l_far, r_far_x, l_near, r_near_x) or \
+                    (r_far_x - l_far) >= (r_near_x - l_near) - p.fork_gap
+                if diverge:
+                    branches = {}
+                    for side, c, m in (("left", cl, ml), ("right", cr, mr)):
+                        bcx, bcy = m["m10"] / m["m00"], m["m01"] / m["m00"] + top
+                        branches[side] = dict(offset=norm(bcx), centroid=(bcx, bcy), contour=c + lift)
+                else:
+                    # merge: the line nearest the image centre in the closest shared row is ours
+                    c, m = (cl, ml) if (l_near is not None and r_near_x is not None and
+                                        abs(l_near - w / 2.0) <= abs(r_near_x - w / 2.0)) else (cr, mr)
+                    res["offset"] = norm(m["m10"] / m["m00"])
+                    res["centroid"] = (m["m10"] / m["m00"], m["m01"] / m["m00"] + top)
+                    res["contour"] = c + lift
+    if branches is not None:
+        res["fork"], res["branches"] = True, branches
     return res
 
 
@@ -442,6 +642,46 @@ class Perception:
         self.count = 0                 # consecutive frames wanting the other source
         self.deb = Debounce(p.bad_frames, p.good_frames)
         self.switch_msg = None
+        self.fork_plan = parse_fork_plan(p.fork_plan)
+        self.fork_msg = None           # fork episode start/end/reset message for the log (like switch_msg)
+        self.fork_reset(log=False)
+
+    def fork_reset(self, log=True):
+        """Back to the first plan entry (/perception/fork_reset). Ends a running episode."""
+        self.fork_idx = 0              # plan entry for the current / next fork
+        self.fork_count = 0            # episodes completed
+        self.fork_seen = 0             # consecutive frames with a fork
+        self.fork_unseen = 0           # consecutive frames without one (during an episode)
+        self.fork_side = None          # side being followed while an episode is running
+        if log:
+            self.fork_msg = "fork plan reset -> next fork: %s" % self.fork_plan[0].upper()
+
+    def _fork_update(self, seen, line_seen=True):
+        """Advance the fork episode state; return the side to follow if a fork is seen this frame.
+        Only frames that show a single line count toward ending an episode: while the line is lost
+        (e.g. the car is backing up to find it) the same fork must not be counted as the next one."""
+        p = self.p
+        nxt = self.fork_plan[self.fork_idx % len(self.fork_plan)]
+        if seen:
+            self.fork_seen += 1
+            self.fork_unseen = 0
+            enter = 1 if self.single else max(1, p.fork_enter)
+            if self.fork_side is None and self.fork_seen >= enter:
+                self.fork_side = nxt
+                self.fork_msg = "fork #%d: episode start -> %s" % (self.fork_count + 1, nxt.upper())
+            return self.fork_side or nxt
+        self.fork_seen = 0
+        if self.fork_side is not None and line_seen:
+            self.fork_unseen += 1
+            if self.fork_unseen >= max(1, p.fork_exit):
+                self.fork_count += 1
+                self.fork_idx += 1
+                self.fork_msg = "fork #%d: episode end (took %s); next fork -> %s" % (
+                    self.fork_count, self.fork_side.upper(),
+                    self.fork_plan[self.fork_idx % len(self.fork_plan)].upper())
+                self.fork_side = None
+                self.fork_unseen = 0
+        return None
 
     def _want_switch(self, color_bright, color_conf, ir_ok, ir_avail, color_view_ok):
         p = self.p
@@ -465,6 +705,7 @@ class Perception:
     def step(self, color, ir, steps):
         p = self.p
         self.switch_msg = None
+        self.fork_msg = None
         ir_avail = ir is not None
         if p.source == "ir" and ir_avail:
             self.source = "ir"
@@ -522,6 +763,14 @@ class Perception:
             else:
                 self.count = 0
 
+        # fork: follow the planned branch (changes nothing unless a fork is visible)
+        fork_seen = bool(det.get("fork"))
+        choice = self._fork_update(fork_seen, line_seen=det["why"] == "line")
+        det["fork_choice"] = choice
+        if choice is not None:
+            br = det["branches"][choice]
+            det["offset"], det["centroid"] = br["offset"], br["centroid"]
+
         raw_ok = not view_bad
         view_ok = raw_ok if self.single else self.deb.update(raw_ok)
         reasons = list(view_bad)
@@ -529,15 +778,32 @@ class Perception:
             reasons.append(det["why"])
         if view_ok != raw_ok:
             reasons.append("settling")
+        # reported confidence also falls as the image gets blurrier (1.0 at --blur-good, 0.4 at the
+        # view_ok limit), so auto_node SLOWS before view_ok stops it (G2: "slows or stops")
+        bmin = p.ir_blur_min if used == "ir" else p.blur_min
+        sharp = _clip01((lap_var - bmin) / max(p.blur_good - bmin, 1.0))
+        conf_out = det["confidence"] * (0.4 + 0.6 * sharp)
         info = dict(offset=det["offset"], view_ok=bool(view_ok), raw_ok=raw_ok, lap_var=lap_var,
-                    bright=bright, source=used, confidence=det["confidence"],
-                    degrade=int(steps), reason=",".join(reasons) or "ok", thresh=det["thresh"])
+                    bright=bright, source=used, confidence=conf_out,
+                    degrade=int(steps), reason=",".join(reasons) or "ok", thresh=det["thresh"],
+                    fork=fork_seen, fork_choice=choice, **self._fork_status())
         return frame, info, det
+
+    def _fork_status(self):
+        return dict(fork_side=self.fork_side, fork_count=self.fork_count)
 
     def missing(self, steps, why="no-frame"):
         self.deb.force_bad()
         return dict(offset=float("nan"), view_ok=False, raw_ok=False, lap_var=0.0, bright=0.0,
-                    source=self.source, confidence=0.0, degrade=int(steps), reason=why, thresh="-")
+                    source=self.source, confidence=0.0, degrade=int(steps), reason=why, thresh="-",
+                    fork=False, fork_choice=None, **self._fork_status())
+
+
+def parse_fork_plan(text):
+    plan = [s.strip().lower() for s in str(text).split(",") if s.strip()]
+    if not plan or any(s not in ("left", "right") for s in plan):
+        raise SystemExit("[camera_node] --fork-plan must be a comma list of left/right, got %r" % text)
+    return plan
 
 
 def status_json(info):
@@ -551,6 +817,9 @@ def status_json(info):
         "confidence": round(float(info["confidence"]), 3),
         "degrade": int(info["degrade"]),
         "reason": str(info["reason"]),
+        "fork": bool(info.get("fork", False)),
+        "fork_side": info.get("fork_side"),
+        "fork_count": int(info.get("fork_count", 0)),
     })
 
 
@@ -570,6 +839,17 @@ def draw_debug(frame, info, det):
         cx, cy = int(det["centroid"][0] * inv), int(det["centroid"][1] * inv)
         cv2.circle(img, (cx, cy), 7, (0, 0, 255), -1)
         cv2.line(img, (w // 2, cy), (cx, cy), (0, 0, 255), 2)
+    choice = det.get("fork_choice")
+    if det.get("branches") and choice:
+        for side in sorted(det["branches"], key=lambda k: k == choice):   # chosen one drawn last
+            br = det["branches"][side]
+            if br["contour"] is None:
+                continue
+            cnt = (br["contour"].astype(np.float32) * inv).astype(np.int32)
+            if side == choice:
+                cv2.drawContours(img, [cnt], -1, (255, 0, 255), 3)     # chosen branch: magenta
+            else:
+                cv2.drawContours(img, [cnt], -1, (255, 255, 255), 1)   # the other one: white
     off = info["offset"]
     off_s = "NaN (no line)" if not math.isfinite(off) else "%+.2f" % off
     ok_col = (0, 200, 0) if info["view_ok"] else (0, 0, 255)
@@ -580,6 +860,11 @@ def draw_debug(frame, info, det):
         ("lapvar: %.0f  bright: %.0f  %s  degrade: %d"
          % (info["lap_var"], info["bright"], info["thresh"], info["degrade"]), (255, 255, 255)),
     ]
+    n = info.get("fork_count", 0) + 1
+    if info.get("fork_choice"):
+        lines.append(("FORK -> %s (#%d)" % (info["fork_choice"].upper(), n), (255, 0, 255)))
+    elif info.get("fork_side"):
+        lines.append(("fork #%d %s: leaving" % (n, info["fork_side"].upper()), (200, 120, 200)))
     cv2.rectangle(img, (0, 0), (w - 1, 8 + 22 * len(lines)), (0, 0, 0), -1)  # text panel
     for i, (txt, col) in enumerate(lines):
         cv2.putText(img, txt, (8, 22 + i * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 1, cv2.LINE_AA)
@@ -601,7 +886,7 @@ def summary(info):
     return "offset=%s view_ok=%s (%s) src=%s conf=%.2f lapvar=%.1f bright=%.1f %s degrade=%d" % (
         "nan" if not math.isfinite(off) else "%+.3f" % off, info["view_ok"], info["reason"],
         info["source"], info["confidence"], info["lap_var"], info["bright"], info["thresh"],
-        info["degrade"])
+        info["degrade"]) + (" FORK->%s" % info["fork_choice"].upper() if info.get("fork_choice") else "")
 
 
 # --------------------------------------------------------------------------- modes
@@ -647,6 +932,8 @@ def run_test(p):
     shown, info, det = per.step(frame, ir, max(0, min(DEGRADE_MAX, p.degrade)))
     ms = (time.perf_counter() - t0) * 1000.0
     save_debug(draw_debug(shown, info, det), p.debug_path)
+    if per.fork_msg:
+        print(per.fork_msg)
     print(status_json(info))
     print(summary(info) + "  (%.1f ms)" % ms)
     print("debug image saved to %s" % p.debug_path)
@@ -676,7 +963,7 @@ def publish_debug_image(node, pub, img, p):
 def run_ros(p):
     import rclpy
     from rclpy.node import Node
-    from std_msgs.msg import Bool, Float32, Int32, String
+    from std_msgs.msg import Bool, Empty, Float32, Int32, String
 
     rclpy.init()
     node = Node("camera_node")
@@ -712,6 +999,15 @@ def run_ros(p):
                 p.ir_enter_bright, p.ir_exit_bright, p.degrade, p.ramp))
 
     per = Perception(p)
+    log.info("fork plan %s (enter %d / exit %d frames); reset with /perception/fork_reset"
+             % (",".join(per.fork_plan), p.fork_enter, p.fork_exit))
+
+    def on_fork_reset(_msg):
+        per.fork_reset()
+        log.info(per.fork_msg)
+        per.fork_msg = None
+
+    node.create_subscription(Empty, "/perception/fork_reset", on_fork_reset, 10)
     t0 = time.monotonic()
     last_debug = 0.0
     last_log = 0.0
@@ -749,6 +1045,8 @@ def run_ros(p):
             pub_status.publish(String(data=status_json(info)))
             if per.switch_msg:
                 log.info(per.switch_msg)
+            if per.fork_msg:
+                log.info(per.fork_msg)
 
             if (pub_img is not None and now - last_img >= 1.0 / p.image_hz
                     and node.count_subscribers(IMAGE_TOPIC) > 0):
@@ -811,8 +1109,22 @@ def parse_args(argv=None):
     ap.add_argument("--max-row-width", type=float, default=0.25,
                     help="if a blob fails the shape test, drop rows wider than this (fraction of image width) "
                          "and re-test; recovers tape touching another light object")
+    ap.add_argument("--fork-plan", default="left,right",
+                    help="side to take at the 1st, 2nd, ... fork, comma list that cycles (default left,right)")
+    ap.add_argument("--fork-enter", type=int, default=3,
+                    help="consecutive fork frames before a fork episode starts (its side is then fixed)")
+    ap.add_argument("--fork-exit", type=int, default=10,
+                    help="consecutive no-fork frames before the episode ends and the plan advances")
+    ap.add_argument("--fork-gap", type=int, default=4,
+                    help="min gap (px at 320x240) between the two branches of a fork")
+    ap.add_argument("--fork-rows", type=int, default=8,
+                    help="min rows (at 320x240) where the two branches are separate to call it a fork")
     ap.add_argument("--min-fill", type=float, default=0.35, help="min blob area / minAreaRect area")
-    ap.add_argument("--blur-min", type=float, default=60.0, help="color: Laplacian variance below this = blurry")
+    ap.add_argument("--blur-min", type=float, default=25.0,
+                    help="color: Laplacian variance below this = blurry (view_ok False). On the car: clear ~550, "
+                         "degrade 1 ~41, 2 ~11, 3 ~5, so degrade 1 = slow down, 2+ = stop")
+    ap.add_argument("--blur-good", type=float, default=200.0,
+                    help="Laplacian variance at/above which blur no longer lowers the reported confidence")
     ap.add_argument("--bright-min", type=float, default=30.0, help="color: mean gray below this = too dark")
     ap.add_argument("--bright-max", type=float, default=230.0, help="color: mean gray above this = washed out")
     ap.add_argument("--ir-blur-min", type=float, default=30.0, help="IR: Laplacian variance below this = blurry")
@@ -846,6 +1158,7 @@ def parse_args(argv=None):
     # ignore ROS args (e.g. --ros-args ...) if someone passes them
     p, _ = ap.parse_known_args(argv)
     p.debug_path = os.path.expanduser(p.debug_path)
+    parse_fork_plan(p.fork_plan)  # fail early on a typo
     return p
 
 
